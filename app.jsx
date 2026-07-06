@@ -181,9 +181,41 @@ const runStakeholders = (co) => apiCall(
 economic_buyer=0.8-1.0, technical_buyer=0.6-0.8. Prioritize: procurement VP, CTO, supply chain lead.`);
 
 const runIntelligence = (co) => apiCall(
-`Semiconductor supplier account intelligence for "${co}". Return JSON:
-{"account_intelligence":{"opportunity_signals":[{"type":"opportunity"|"risk"|"watch","description":"1-2 actionable sentences","urgency":"immediate"|"near_term"|"long_term","source":string|null}],"recommended_next_action":string|null,"current_supplier_status":"no_relationship"|"evaluation"|"approved_vendor"|"active_account"|"strategic_partner"},"news":[{"date":"YYYY-MM-DD","headline":string,"summary":string|null,"source_name":string,"url":string|null,"tags":[string]}]}
-3-5 signals covering expansion plans, qualification cycles, competitive risks. 5-7 news items.`, true);
+`You are a semiconductor sales intelligence analyst. Research "${co}" and identify actionable signals for a chip/semiconductor supplier trying to win or expand business with them.
+
+Search for: "${co} chip procurement", "${co} AI hardware supply chain", "${co} semiconductor spend 2025 2026", "${co} custom silicon", "${co} data center expansion".
+
+Return JSON with EXACTLY this structure — you MUST populate opportunity_signals with at least 3 entries, even for large companies (they always have procurement cycles, insourcing risks, or expansion signals):
+{
+  "account_intelligence": {
+    "opportunity_signals": [
+      {
+        "type": "opportunity" | "risk" | "watch",
+        "description": "1-2 specific, actionable sentences referencing concrete programs, timelines, or dollar figures where known",
+        "urgency": "immediate" | "near_term" | "long_term",
+        "source": string | null
+      }
+    ],
+    "recommended_next_action": "One concrete sentence: who to contact, about what, and why now",
+    "current_supplier_status": "no_relationship" | "evaluation" | "approved_vendor" | "active_account" | "strategic_partner"
+  },
+  "news": [
+    {
+      "date": "YYYY-MM-DD",
+      "headline": string,
+      "summary": string | null,
+      "source_name": string,
+      "url": string | null,
+      "tags": [string]
+    }
+  ]
+}
+
+Signal guidance — always include at minimum:
+- 1 opportunity: chip procurement window, data center build-out, new product line needing components
+- 1 risk: insourcing trend, incumbent supplier lock-in, or budget freeze signal  
+- 1 watch: leadership change, M&A activity, or geopolitical supply chain exposure
+Target 4-5 signals total. Target 5-7 news items, sorted newest first.`, true);
 
 // ── Export ─────────────────────────────────────────────────────
 function toMarkdown(r) {

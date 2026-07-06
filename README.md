@@ -1,6 +1,40 @@
-# Account research pipeline
+# Account Research Pipeline
 
 Automated company research for semiconductor account managers. Given a company name, domain, and optional stock ticker, the pipeline produces a structured JSON record and a human-readable Markdown one-pager covering headquarters, office locations, stakeholder map, financials, and account intelligence signals.
+
+---
+
+## Screenshots
+
+### Research form
+Enter a company name, website domain, and optional stock ticker to start a run.
+
+![Research form](assets/01_form.png)
+
+### Pipeline running
+Four stages execute in sequence — each independently fault-tolerant so a failed web search doesn't block the rest of the run.
+
+![Pipeline running](assets/02_pipeline.png)
+
+### Results — Overview
+Company details, summary, industry verticals, and key competitors pulled from web search and structured into typed fields.
+
+![Overview tab](assets/03_overview.png)
+
+### Results — Economics
+Revenue, margins, R&D spend, capex, and a semiconductor-specific profile including buyer type, fab nodes, known suppliers, and supply gaps.
+
+![Economics tab](assets/04_economics.png)
+
+### Results — Account Intelligence
+Opportunity signals, risks, and watch items tagged by urgency, plus a recommended next action for the account manager.
+
+![Intelligence tab](assets/05_intelligence.png)
+
+### Markdown export
+Every record exports to a clean one-pager — ready to paste into a CRM note, email, or meeting brief.
+
+![Markdown export](assets/06_markdown.png)
 
 ---
 
