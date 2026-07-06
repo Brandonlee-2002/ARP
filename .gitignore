@@ -1,0 +1,42 @@
+# ── Research output files ──────────────────────────────────────
+# Never commit real account research records — these may contain
+# sensitive company intelligence generated during actual use.
+output/
+results/
+Results/
+*.json
+*_summary.md
+*_research.md
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Environment / secrets ─────────────────────────────────────
+# API keys must never be committed.
+.env
+.env.local
+.env.*
+!.env.example        # allow the example template through
+
+# ── Virtual environments ──────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editor and OS ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log

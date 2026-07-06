@@ -1,0 +1,204 @@
+"""
+SEC EDGAR extractor.
+
+For US-listed public companies: fetches the most recent 10-K (domestic)
+or 20-F (foreign private issuer) and extracts the key financial line items
+we need to populate the Economics section.
+
+No API key required — EDGAR has a free public REST API.
+Rate limit: 10 requests/second per EDGAR's fair-use policy.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+EDGAR_BASE = "https://data.sec.gov"
+
+# EDGAR requires a real name and contact email in the User-Agent header
+# as part of their fair-use policy: https://www.sec.gov/developer
+# Replace the values below with your own before running.
+EDGAR_USER_AGENT = "AccountResearchPipeline your-email@example.com"
+HEADERS = {"User-Agent": EDGAR_USER_AGENT}
+
+
+@dataclass
+class EdgarFinancials:
+    """Raw financial figures pulled from EDGAR XBRL facts."""
+    ticker:               str
+    cik:                  Optional[str]   = None
+    fiscal_year:          Optional[int]   = None
+    form_type:            Optional[str]   = None
+    filed_date:           Optional[str]   = None
+    revenue_usd:          Optional[float] = None   # in USD (not millions)
+    gross_profit_usd:     Optional[float] = None
+    operating_income_usd: Optional[float] = None
+    net_income_usd:       Optional[float] = None
+    rd_expense_usd:       Optional[float] = None
+    capex_usd:            Optional[float] = None
+    total_assets_usd:     Optional[float] = None
+    data_quality:         str             = "audited"
+
+
+class EdgarExtractor:
+    """
+    Pulls financial data from SEC EDGAR for any company with a US CIK.
+
+    Usage:
+        extractor = EdgarExtractor()
+        data = extractor.fetch(ticker="INTC")
+    """
+
+    def __init__(self, timeout: int = 20):
+        self.timeout = timeout
+        self._client = httpx.Client(headers=HEADERS, timeout=timeout)
+
+    def fetch(self, ticker: str) -> Optional[EdgarFinancials]:
+        """
+        Main entry point. Returns None if the company isn't found on EDGAR
+        (e.g. it's a foreign private issuer not cross-listed on US exchanges,
+        or it's private).
+        """
+        try:
+            cik = self._resolve_cik(ticker)
+            if not cik:
+                logger.info("[edgar] No CIK found for %s — skipping", ticker)
+                return None
+
+            facts = self._fetch_facts(cik)
+            if not facts:
+                return None
+
+            result = self._extract_financials(ticker, cik, facts)
+            logger.info("[edgar] Fetched financials for %s (CIK %s)", ticker, cik)
+            return result
+
+        except Exception as exc:
+            logger.warning("[edgar] Failed for %s: %s", ticker, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # CIK resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_cik(self, ticker: str) -> Optional[str]:
+        """
+        EDGAR's company tickers endpoint maps ticker → CIK.
+        Returns zero-padded 10-digit CIK string.
+        """
+        time.sleep(0.1)   # stay under 10 req/s
+        resp = self._client.get(f"{EDGAR_BASE}/files/company_tickers.json")
+        resp.raise_for_status()
+        data = resp.json()
+
+        ticker_upper = ticker.upper()
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == ticker_upper:
+                return str(entry["cik_str"]).zfill(10)
+        return None
+
+    # ------------------------------------------------------------------
+    # XBRL facts
+    # ------------------------------------------------------------------
+
+    def _fetch_facts(self, cik: str) -> Optional[dict]:
+        """
+        Downloads the full XBRL facts JSON for a given CIK.
+        This is a ~2-10MB payload — we parse only what we need.
+        """
+        time.sleep(0.1)
+        url = f"{EDGAR_BASE}/api/xbrl/companyfacts/CIK{cik}.json"
+        resp = self._client.get(url, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Extraction helpers
+    # ------------------------------------------------------------------
+
+    def _extract_financials(
+        self, ticker: str, cik: str, facts: dict
+    ) -> EdgarFinancials:
+        result = EdgarFinancials(ticker=ticker, cik=cik)
+
+        us_gaap = facts.get("facts", {}).get("us-gaap", {})
+        ifrs    = facts.get("facts", {}).get("ifrs-full", {})   # for foreign filers
+
+        # Prefer US GAAP; fall back to IFRS
+        concepts = us_gaap if us_gaap else ifrs
+
+        result.revenue_usd          = self._latest_annual(concepts, [
+            "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "SalesRevenueNet", "RevenueFromSaleOfGoods",
+        ])
+        result.gross_profit_usd     = self._latest_annual(concepts, ["GrossProfit"])
+        result.operating_income_usd = self._latest_annual(concepts, [
+            "OperatingIncomeLoss", "ProfitLossFromOperatingActivities",
+        ])
+        result.net_income_usd       = self._latest_annual(concepts, [
+            "NetIncomeLoss", "ProfitLoss",
+        ])
+        result.rd_expense_usd       = self._latest_annual(concepts, [
+            "ResearchAndDevelopmentExpense",
+            "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+        ])
+        result.capex_usd            = self._latest_annual(concepts, [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PurchaseOfPropertyPlantAndEquipment",
+        ])
+        result.total_assets_usd     = self._latest_annual(concepts, ["Assets"])
+
+        # Infer fiscal year from the revenue filing date
+        revenue_entry = self._latest_annual_entry(concepts, [
+            "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+        ])
+        if revenue_entry:
+            result.fiscal_year = int(revenue_entry.get("end", "0000")[:4])
+            result.filed_date  = revenue_entry.get("filed")
+            result.form_type   = revenue_entry.get("form")
+
+        return result
+
+    def _latest_annual(self, concepts: dict, keys: list[str]) -> Optional[float]:
+        entry = self._latest_annual_entry(concepts, keys)
+        return float(entry["val"]) if entry else None
+
+    def _latest_annual_entry(self, concepts: dict, keys: list[str]) -> Optional[dict]:
+        """
+        Finds the most recent annual (10-K or 20-F) filing entry
+        for any of the given XBRL concept keys.
+        """
+        for key in keys:
+            concept = concepts.get(key, {})
+            units = concept.get("units", {})
+            usd_entries = units.get("USD", [])
+
+            # Filter to annual filings only (form 10-K or 20-F)
+            annual = [
+                e for e in usd_entries
+                if e.get("form") in ("10-K", "20-F")
+                and e.get("filed")
+            ]
+            if annual:
+                # Most recently filed
+                annual.sort(key=lambda e: e["filed"], reverse=True)
+                return annual[0]
+        return None
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
