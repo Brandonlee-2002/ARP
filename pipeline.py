@@ -321,8 +321,52 @@ class AccountResearchPipeline:
 
 ---
 
+## Verification
+{self._render_verification(r)}
+
+---
+
 *Sources: {", ".join(s.name for s in r.meta.sources[:5])}{"..." if len(r.meta.sources) > 5 else ""}*
 """
+
+    # ------------------------------------------------------------------
+    # Verification renderer
+    # ------------------------------------------------------------------
+
+    def _render_verification(self, r: AccountResearchRecord) -> str:
+        """
+        Renders a concise verification summary for the Markdown one-pager.
+        Shows financial discrepancies vs EDGAR and citation warnings.
+        """
+        lines = []
+
+        discrepancies = r.meta.financial_discrepancies
+        if discrepancies:
+            lines.append("**⚠ Financial discrepancies vs EDGAR audited filing:**")
+            for d in discrepancies:
+                lines.append(
+                    f"  - **{d.field}**: LLM estimated ${d.llm_m:,.0f}M vs "
+                    f"EDGAR audited ${d.edgar_m:,.0f}M ({d.pct_diff}% off) — "
+                    f"use EDGAR figure"
+                )
+        else:
+            lines.append("✓ No financial discrepancies detected vs EDGAR")
+
+        citation_warnings = r.meta.citation_warnings
+        total_signals = len(r.account_intelligence.opportunity_signals)
+        cited = total_signals - citation_warnings
+        if citation_warnings > 0:
+            lines.append(
+                f"**⚠ Citation check**: {cited}/{total_signals} signals have a "
+                f"source URL — {citation_warnings} signal"
+                f"{'s are' if citation_warnings > 1 else ' is'} unverified"
+            )
+        elif total_signals > 0:
+            lines.append(f"✓ All {total_signals} signals have source URLs")
+        else:
+            lines.append("✓ No signals to audit")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Internal helpers

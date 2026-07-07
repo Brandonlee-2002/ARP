@@ -23,6 +23,7 @@ from ..models.schema import (
     ConfidenceMap,
     Economics,
     EdgarFinancials,    # re-export for type hint
+    FinancialDiscrepancy,
     Financials,
     Location,
     Meta,
@@ -116,11 +117,39 @@ class RecordAssembler:
         # ------------------------------------------------------------------
         # Assemble
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Verification
+        # ------------------------------------------------------------------
+        financial_discrepancies = self._check_financial_discrepancies(
+            economics, edgar_data
+        )
+        citation_warnings = self._audit_signal_citations(account_intelligence)
+
+        if financial_discrepancies:
+            logger.warning(
+                "[assembler] %d financial discrepanc%s vs EDGAR: %s",
+                len(financial_discrepancies),
+                "ies" if len(financial_discrepancies) > 1 else "y",
+                ", ".join(
+                    f"{d.field} {d.pct_diff}% off"
+                    for d in financial_discrepancies
+                ),
+            )
+        if citation_warnings:
+            logger.warning(
+                "[assembler] %d signal%s %s no source URL — treat with caution",
+                citation_warnings,
+                "s" if citation_warnings > 1 else "",
+                "have" if citation_warnings > 1 else "has",
+            )
+
         meta = Meta(
             refreshed_at=now,
             refresh_cadence=refresh_cadence,
             confidence=confidence,
             sources=sources,
+            financial_discrepancies=financial_discrepancies,
+            citation_warnings=citation_warnings,
         )
 
         return AccountResearchRecord(
@@ -249,6 +278,78 @@ class RecordAssembler:
             except (ValidationError, TypeError) as exc:
                 logger.debug("[assembler] news item skipped: %s", exc)
         return sorted(news, key=lambda n: n.date, reverse=True)[:10]
+
+    # ------------------------------------------------------------------
+    # Verification methods
+    # ------------------------------------------------------------------
+
+    _DISCREPANCY_THRESHOLD = 0.20  # flag fields that diverge >20% from EDGAR
+
+    def _check_financial_discrepancies(
+        self,
+        economics:  Economics,
+        edgar:      Optional[EdgarFinancials],
+    ) -> list[FinancialDiscrepancy]:
+        """
+        Compare LLM financial estimates against EDGAR audited figures.
+        Returns a list of fields that diverge by more than _DISCREPANCY_THRESHOLD.
+        Only meaningful for public companies where EDGAR data was fetched AND
+        the LLM returned its own estimates (data_quality != "audited").
+        """
+        if not edgar:
+            return []
+
+        def _to_m(v: Optional[float]) -> Optional[float]:
+            return round(v / 1_000_000, 1) if v else None
+
+        edgar_figures = {
+            "Revenue":    _to_m(edgar.revenue_usd),
+            "R&D spend":  _to_m(edgar.rd_expense_usd),
+            "Capex":      _to_m(edgar.capex_usd),
+            "Net income": _to_m(edgar.net_income_usd),
+        }
+        llm_figures = {
+            "Revenue":    economics.financials.revenue_usd_m,
+            "R&D spend":  economics.financials.rd_spend_usd_m,
+            "Capex":      economics.financials.capex_usd_m,
+            "Net income": economics.financials.net_income_usd_m,
+        }
+
+        discrepancies = []
+        for field, edgar_val in edgar_figures.items():
+            llm_val = llm_figures.get(field)
+            if llm_val is None or edgar_val is None or edgar_val == 0:
+                continue
+            delta = abs(llm_val - edgar_val) / abs(edgar_val)
+            if delta > self._DISCREPANCY_THRESHOLD:
+                discrepancies.append(FinancialDiscrepancy(
+                    field=field,
+                    llm_m=llm_val,
+                    edgar_m=edgar_val,
+                    pct_diff=round(delta * 100),
+                ))
+        return discrepancies
+
+    def _audit_signal_citations(
+        self,
+        account_intelligence: AccountIntelligence,
+    ) -> int:
+        """
+        Mark each OpportunitySignal as cited or uncited based on whether it
+        has a non-empty source URL. Mutates the signals in place and returns
+        the count of uncited signals.
+        """
+        uncited = 0
+        for signal in account_intelligence.opportunity_signals:
+            is_cited = bool(signal.source and signal.source.strip())
+            # Pydantic models are immutable by default; use model_copy
+            try:
+                signal.__dict__["cited"] = is_cited
+            except Exception:
+                pass  # if mutation fails, cited stays False (schema default)
+            if not is_cited:
+                uncited += 1
+        return uncited
 
     # ------------------------------------------------------------------
     # Confidence scoring

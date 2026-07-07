@@ -121,6 +121,14 @@ class SourceRecord(BaseModel):
     fields_populated: list[str] = Field(default_factory=list)
 
 
+class FinancialDiscrepancy(BaseModel):
+    """A single field where the LLM estimate diverges >20% from the EDGAR audited figure."""
+    field:    str
+    llm_m:    float   # LLM estimate in USD millions
+    edgar_m:  float   # EDGAR audited figure in USD millions
+    pct_diff: int     # absolute percentage difference, rounded
+
+
 class ConfidenceMap(BaseModel):
     overall:      Confidence = Confidence.LOW
     overview:     Confidence = Confidence.LOW
@@ -137,6 +145,9 @@ class Meta(BaseModel):
     refresh_cadence: RefreshCadence = RefreshCadence.WEEKLY
     confidence:      ConfidenceMap  = Field(default_factory=ConfidenceMap)
     sources:         list[SourceRecord] = Field(default_factory=list)
+    # Verification metadata (populated by RecordAssembler)
+    financial_discrepancies: list[FinancialDiscrepancy] = Field(default_factory=list)
+    citation_warnings:       int                        = 0
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +270,7 @@ class OpportunitySignal(BaseModel):
     description: str
     urgency:     Urgency
     source:      Optional[str] = None
+    cited:       bool          = False  # True when source is a non-empty URL
 
 
 class AccountIntelligence(BaseModel):

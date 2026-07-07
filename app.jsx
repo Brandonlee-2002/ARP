@@ -142,33 +142,78 @@ const sigC  = t => ({opportunity:"var(--text-success)",risk:"var(--text-danger)"
 const sigB  = t => ({opportunity:"var(--bg-success)",risk:"var(--bg-danger)",watch:"var(--bg-warning)"}[t]||"var(--surface-1)");
 const sigBr = t => ({opportunity:"var(--border-success)",risk:"var(--border-danger)",watch:"var(--border-warning)"}[t]||"var(--border)");
 
+// ── Verification helpers ───────────────────────────────────────
+// Financial sanity check: flag fields where LLM estimate vs EDGAR audited
+// figure diverges by more than DISCREPANCY_THRESHOLD.
+const DISCREPANCY_THRESHOLD = 0.20; // 20%
+
+function checkFinancialDiscrepancies(llmFinancials, edgarFinancials) {
+  if (!edgarFinancials) return []; // no EDGAR data, nothing to compare
+  const checks = [
+    { field: "Revenue",  llm: llmFinancials.revenue_usd_m,  edgar: edgarFinancials.revenue_usd_m  },
+    { field: "R&D spend",llm: llmFinancials.rd_spend_usd_m, edgar: edgarFinancials.rd_spend_usd_m },
+    { field: "Capex",    llm: llmFinancials.capex_usd_m,    edgar: edgarFinancials.capex_usd_m    },
+    { field: "Net income",llm: llmFinancials.net_income_usd_m, edgar: edgarFinancials.net_income_usd_m },
+  ];
+  return checks.filter(c => {
+    if (c.llm == null || c.edgar == null) return false;
+    const delta = Math.abs(c.llm - c.edgar) / Math.abs(c.edgar);
+    return delta > DISCREPANCY_THRESHOLD;
+  }).map(c => ({
+    field: c.field,
+    llm: c.llm,
+    edgar: c.edgar,
+    pctDiff: Math.round(Math.abs(c.llm - c.edgar) / Math.abs(c.edgar) * 100),
+  }));
+}
+
+// Citation anchoring: signals without a source URL are flagged as unverified.
+function auditSignalCitations(signals) {
+  return signals.map(sig => ({
+    ...sig,
+    _cited: !!(sig.source && sig.source.trim().length > 0),
+  }));
+}
+
 // ── API ────────────────────────────────────────────────────────
 const SYS = `You are a semiconductor sales intelligence extractor. Return ONLY valid JSON. Use null for unknowns. Never fabricate specific numbers. data_quality: "audited"|"estimated"|"inferred".`;
 
-async function apiCall(prompt, webSearch = false) {
+async function apiCall(prompt, webSearch = false, maxTokens = 2000, systemOverride = null) {
   const body = {
-    model: MODEL, max_tokens: 2000, system: SYS,
+    model: MODEL, max_tokens: maxTokens,
+    system: systemOverride || SYS,
     messages: [{ role: "user", content: prompt }],
   };
   if (webSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`API error ${r.status}`);
+  if (!r.ok) {
+    const errBody = await r.text();
+    throw new Error(`API ${r.status}: ${errBody.slice(0,200)}`);
+  }
   const d = await r.json();
+  // Web search responses interleave tool_use blocks before the final text block
   const text = d.content.filter(b => b.type === "text").map(b => b.text).join("");
+  if (!text) throw new Error(`No text block (stop: ${d.stop_reason}, blocks: ${d.content.map(b=>b.type).join(",")})`);
   const clean = text.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim();
   try { return JSON.parse(clean); } catch {
     const m = clean.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-    if (m) return JSON.parse(m[0]);
-    throw new Error("JSON parse failed");
+    if (m) try { return JSON.parse(m[0]); } catch {}
+    throw new Error(`JSON parse failed. Preview: ${clean.slice(0,120)}`);
   }
 }
 
+// Stage 1a — company overview fields only (no locations)
 const runOverview = (co, domain, ticker) => apiCall(
-`Research "${co}" (domain:${domain}${ticker?", ticker:"+ticker:""}). Return JSON with exactly these two keys:
-{"overview":{"legal_name":string,"doing_business_as":string|null,"ticker":{"symbol":string,"exchange":string}|null,"ownership_type":"public"|"private"|"subsidiary"|"jv"|"government","parent_company":string|null,"founded_year":integer|null,"website":string,"industry_verticals":[string],"employee_count":{"value":integer,"approximate":boolean}|null,"summary":"3-4 sentences covering what they do, market position, and relevance to a semiconductor supplier","competitors":[string],"key_products":[string]},"locations":[{"type":"hq"|"regional_hq"|"fab"|"assembly"|"rd_center"|"design_center"|"sales_office","name":string|null,"city":string,"state_region":string|null,"country":string,"country_code":"2-letter ISO","status":"active"|"ramping"|"under_construction"|"planned"|"closed","notes":string|null}]}
-HQ first. Max 10 locations. For semiconductor companies distinguish fab sites from offices.`, true);
+`Research "${co}" (domain:${domain}${ticker?", ticker:"+ticker:""}). Return JSON with exactly this key:
+{"overview":{"legal_name":string,"doing_business_as":string|null,"ticker":{"symbol":string,"exchange":string}|null,"ownership_type":"public"|"private"|"subsidiary"|"jv"|"government","parent_company":string|null,"founded_year":integer|null,"website":string,"industry_verticals":[string],"employee_count":{"value":integer,"approximate":boolean}|null,"summary":"3-4 sentences covering what they do, market position, and relevance to a semiconductor supplier","competitors":[string],"key_products":[string]}}`, true, 1500);
+
+// Stage 1b — locations only, separate call to avoid token overflow on large companies
+const runLocations = (co) => apiCall(
+`List the key office, fab, R&D, and sales locations for "${co}". Return a JSON array only:
+[{"type":"hq"|"regional_hq"|"fab"|"assembly"|"rd_center"|"design_center"|"sales_office","name":string|null,"city":string,"state_region":string|null,"country":string,"country_code":"2-letter ISO","status":"active"|"ramping"|"under_construction"|"planned"|"closed","notes":string|null}]
+HQ first. Max 8 locations. For semiconductor companies distinguish fab sites from offices.`, true, 1500);
 
 const runEconomics = (co, ticker) => apiCall(
 `Financial and semiconductor data for "${co}"${ticker?" (ticker:"+ticker+")":"(private company)"}. Return JSON:
@@ -186,36 +231,16 @@ const runIntelligence = (co) => apiCall(
 Search for: "${co} chip procurement", "${co} AI hardware supply chain", "${co} semiconductor spend 2025 2026", "${co} custom silicon", "${co} data center expansion".
 
 Return JSON with EXACTLY this structure — you MUST populate opportunity_signals with at least 3 entries, even for large companies (they always have procurement cycles, insourcing risks, or expansion signals):
-{
-  "account_intelligence": {
-    "opportunity_signals": [
-      {
-        "type": "opportunity" | "risk" | "watch",
-        "description": "1-2 specific, actionable sentences referencing concrete programs, timelines, or dollar figures where known",
-        "urgency": "immediate" | "near_term" | "long_term",
-        "source": string | null
-      }
-    ],
-    "recommended_next_action": "One concrete sentence: who to contact, about what, and why now",
-    "current_supplier_status": "no_relationship" | "evaluation" | "approved_vendor" | "active_account" | "strategic_partner"
-  },
-  "news": [
-    {
-      "date": "YYYY-MM-DD",
-      "headline": string,
-      "summary": string | null,
-      "source_name": string,
-      "url": string | null,
-      "tags": [string]
-    }
-  ]
-}
+{"account_intelligence":{"opportunity_signals":[{"type":"opportunity"|"risk"|"watch","description":"1-2 specific actionable sentences referencing concrete programs timelines or dollar figures where known","urgency":"immediate"|"near_term"|"long_term","source":string|null}],"recommended_next_action":"One concrete sentence: who to contact about what and why now","current_supplier_status":"no_relationship"|"evaluation"|"approved_vendor"|"active_account"|"strategic_partner"},"news":[{"date":"YYYY-MM-DD","headline":string,"summary":string|null,"source_name":string,"url":string|null,"tags":[string]}]}
 
 Signal guidance — always include at minimum:
-- 1 opportunity: chip procurement window, data center build-out, new product line needing components
-- 1 risk: insourcing trend, incumbent supplier lock-in, or budget freeze signal  
-- 1 watch: leadership change, M&A activity, or geopolitical supply chain exposure
-Target 4-5 signals total. Target 5-7 news items, sorted newest first.`, true);
+- 1 opportunity signal: chip procurement window, data center build-out, or new product line needing components
+- 1 risk signal: insourcing trend, incumbent supplier lock-in, or budget freeze signal
+- 1 watch signal: leadership change, M&A activity, or geopolitical supply chain exposure
+Target 4-5 signals total. Target 5-7 news items sorted newest first.
+
+After searching, output ONLY the JSON object — no preamble, no explanation.`, true, 3000,
+  `You are a semiconductor sales intelligence analyst. Search the web thoroughly, then output ONLY a valid JSON object matching the exact schema provided. No prose, no markdown fences, no explanation before or after the JSON.`);
 
 // ── Export ─────────────────────────────────────────────────────
 function toMarkdown(r) {
@@ -615,6 +640,7 @@ function EconomicsSection({ r }) {
   const f    = r.economics?.financials||{};
   const semi = r.economics?.semiconductor_profile||{};
   const segs = r.economics?.revenue_segments||[];
+  const discrepancies = r.meta?.financialDiscrepancies||[];
   const metrics = [
     ["Revenue",     fmtM(f.revenue_usd_m),   `FY${f.fiscal_year||"N/A"}`],
     ["YoY growth",  fmtP(f.revenue_growth_pct),""],
@@ -623,8 +649,30 @@ function EconomicsSection({ r }) {
     ["Capex",       fmtM(f.capex_usd_m),      ""],
     ["Market cap",  fmtM(f.market_cap_usd_m), ""],
   ];
+  const discrepantFields = new Set(discrepancies.map(d => d.field));
+  const metricFieldMap = {"Revenue":"Revenue","R&D spend":"R&D spend","Capex":"Capex","Net income":"Net income"};
   return (
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      {discrepancies.length>0 && (
+        <div style={{padding:"12px 16px",background:"var(--bg-warning)",border:"0.5px solid var(--border-warning)",borderRadius:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+            <i className="ti ti-alert-triangle" style={{color:"var(--text-warning)",fontSize:15}}/>
+            <p style={{fontSize:12,fontWeight:600,color:"var(--text-warning)",margin:0}}>Financial discrepancies vs EDGAR audited filing</p>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {discrepancies.map((d,i) => (
+              <div key={i} style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"var(--text-primary)",padding:"3px 0",borderBottom:i<discrepancies.length-1?"0.5px solid var(--border-warning)":"none"}}>
+                <span>{d.field}</span>
+                <span style={{fontFamily:"var(--font-mono)",fontSize:12}}>
+                  LLM: {fmtM(d.llm)} · EDGAR: {fmtM(d.edgar)}
+                  <span style={{color:"var(--text-warning)",marginLeft:8}}>{d.pctDiff}% off</span>
+                </span>
+              </div>
+            ))}
+          </div>
+          <p style={{fontSize:11,color:"var(--text-secondary)",margin:"8px 0 0"}}>EDGAR figures are from audited filings and take precedence. The LLM estimate was retained here for reference.</p>
+        </div>
+      )}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:12}}>
         {metrics.map(([label,val,sub]) => (
           <div key={label} style={{background:"var(--surface-1)",borderRadius:"var(--radius)",padding:"0.85rem 1rem"}}>
@@ -689,6 +737,11 @@ function IntelligenceSection({ r }) {
           <p style={{fontSize:11,color:"var(--text-muted)",margin:"0 0 4px"}}>Signals identified</p>
           <p style={{fontSize:15,fontWeight:500,margin:0}}>{sigs.length}</p>
         </div>
+        <div style={{background:"var(--surface-1)",borderRadius:"var(--radius)",padding:"0.85rem 1rem"}}>
+          <p style={{fontSize:11,color:"var(--text-muted)",margin:"0 0 4px"}}>Cited signals</p>
+          <p style={{fontSize:15,fontWeight:500,margin:0,color:sigs.filter(s=>s._cited).length===sigs.length&&sigs.length>0?"var(--text-success)":"var(--text-warning)"}}
+          >{sigs.filter(s=>s._cited).length}/{sigs.length}</p>
+        </div>
       </div>
       {intel.recommended_next_action && (
         <div style={{padding:"12px 16px",background:"var(--bg-accent)",border:"0.5px solid var(--border-accent)",borderRadius:12}}>
@@ -698,13 +751,24 @@ function IntelligenceSection({ r }) {
       )}
       <div style={{display:"flex",flexDirection:"column",gap:8}}>
         {sigs.map((sig,i) => (
-          <div key={i} style={{background:sigB(sig.type),border:`0.5px solid ${sigBr(sig.type)}`,borderRadius:12,padding:"10px 14px"}}>
-            <div style={{display:"flex",gap:8,marginBottom:6,flexWrap:"wrap"}}>
+          <div key={i} style={{background:sigB(sig.type),border:`0.5px solid ${sig._cited===false?"var(--border-warning)":sigBr(sig.type)}`,borderRadius:12,padding:"10px 14px"}}>
+            <div style={{display:"flex",gap:8,marginBottom:6,flexWrap:"wrap",alignItems:"center"}}>
               <Badge bg={sigB(sig.type)} color={sigC(sig.type)}>{sig.type}</Badge>
               <Badge>{(sig.urgency||"").replace(/_/g," ")}</Badge>
+              {sig._cited===false && (
+                <Badge bg="var(--bg-warning)" color="var(--text-warning)">
+                  <i className="ti ti-alert-triangle" style={{fontSize:10,marginRight:3}}/>unverified
+                </Badge>
+              )}
+              {sig._cited===true && (
+                <Badge bg="var(--bg-success)" color="var(--text-success)">
+                  <i className="ti ti-circle-check" style={{fontSize:10,marginRight:3}}/>cited
+                </Badge>
+              )}
             </div>
             <p style={{fontSize:13,color:"var(--text-primary)",margin:0,lineHeight:1.55}}>{sig.description}</p>
             {sig.source && <p style={{fontSize:11,color:"var(--text-muted)",margin:"6px 0 0"}}>Source: {sig.source}</p>}
+            {sig._cited===false && <p style={{fontSize:11,color:"var(--text-warning)",margin:"6px 0 0"}}>No source URL — independently verify before using in a sales context.</p>}
           </div>
         ))}
         {!sigs.length && <p style={{color:"var(--text-muted)",fontSize:13}}>No signals identified.</p>}
@@ -1019,25 +1083,40 @@ export default function App() {
     };
     setCurrentRecord(rec); setView("pipeline");
 
-    // Stage 1 — Overview
+    // Stage 1 — Overview + Locations (two separate calls to avoid token overflow)
     setStage(0,"running"); addLog(`Researching ${form.company} (${form.domain})…`);
     try {
-      const d = await runOverview(form.company, form.domain, form.ticker);
-      rec = { ...rec, overview:{...rec.overview,...(d.overview||{})}, locations:d.locations||[] };
-      rec.meta.confidence.overview  = d.overview?.summary?"high":"medium";
-      rec.meta.confidence.locations = (d.locations||[]).length>1?"high":"medium";
+      const [dOv, dLoc] = await Promise.all([
+        runOverview(form.company, form.domain, form.ticker),
+        runLocations(form.company),
+      ]);
+      const locations = Array.isArray(dLoc) ? dLoc : (dLoc?.locations || []);
+      rec = { ...rec, overview:{...rec.overview,...(dOv.overview||{})}, locations };
+      rec.meta.confidence.overview  = dOv.overview?.summary?"high":"medium";
+      rec.meta.confidence.locations = locations.length>1?"high":"medium";
       setCurrentRecord({...rec}); setStage(0,"done");
       addLog(`Overview: ${rec.overview.legal_name} · ${rec.locations.length} locations`);
     } catch(e) { setStage(0,"error"); addLog(`Overview error: ${e.message}`); }
 
-    // Stage 2 — Economics
+    // Stage 2 — Economics + financial sanity check
     setStage(1,"running"); addLog(`Extracting financial data${form.ticker?" for "+form.ticker:""}…`);
     try {
       const d = await runEconomics(form.company, form.ticker);
-      rec = { ...rec, economics:{ financials:d.financials||{}, revenue_segments:d.revenue_segments||[], semiconductor_profile:d.semiconductor_profile||{} }};
-      rec.meta.confidence.economics = d.financials?.data_quality==="audited"?"high":d.financials?.revenue_usd_m?"medium":"low";
+      const llmFin = d.financials||{};
+      rec = { ...rec, economics:{ financials:llmFin, revenue_segments:d.revenue_segments||[], semiconductor_profile:d.semiconductor_profile||{} }};
+      rec.meta.confidence.economics = llmFin.data_quality==="audited"?"high":llmFin.revenue_usd_m?"medium":"low";
+
+      // Financial sanity check — compare LLM estimates against EDGAR audited figures
+      // Only meaningful when data_quality is NOT audited (i.e. LLM estimated)
+      const edgarFin = rec._edgarFinancials||null;
+      const discrepancies = checkFinancialDiscrepancies(llmFin, edgarFin);
+      rec.meta.financialDiscrepancies = discrepancies;
+      if (discrepancies.length > 0) {
+        addLog(`⚠ Financial check: ${discrepancies.length} discrepanc${discrepancies.length>1?"ies":"y"} vs EDGAR — ${discrepancies.map(d=>d.field+" "+d.pctDiff+"%").join(", ")}`);
+      }
+
       setCurrentRecord({...rec}); setStage(1,"done");
-      addLog(`Economics: ${d.financials?.revenue_usd_m?fmtM(d.financials.revenue_usd_m)+" revenue":"estimates only"} · ${d.financials?.data_quality||"inferred"}`);
+      addLog(`Economics: ${llmFin.revenue_usd_m?fmtM(llmFin.revenue_usd_m)+" revenue":"estimates only"} · ${llmFin.data_quality||"inferred"}`);
     } catch(e) { setStage(1,"error"); addLog(`Economics error: ${e.message}`); }
 
     // Stage 3 — Stakeholders
@@ -1051,16 +1130,27 @@ export default function App() {
       addLog(`Stakeholders: ${stks.length} decision-makers identified`);
     } catch(e) { setStage(2,"error"); addLog(`Stakeholders error: ${e.message}`); }
 
-    // Stage 4 — Intelligence
+    // Stage 4 — Intelligence + citation audit
     setStage(3,"running"); addLog("Assembling account intelligence…");
     try {
       const d = await runIntelligence(form.company);
-      rec = { ...rec, account_intelligence:d.account_intelligence||rec.account_intelligence, news:d.news||[] };
+      const intel = d.account_intelligence||rec.account_intelligence;
+
+      // Citation anchoring — flag signals that have no source URL
+      const auditedSignals = auditSignalCitations(intel.opportunity_signals||[]);
+      const uncitedCount = auditedSignals.filter(s => !s._cited).length;
+      intel.opportunity_signals = auditedSignals;
+      rec.meta.citationWarnings = uncitedCount;
+      if (uncitedCount > 0) {
+        addLog(`⚠ Citation check: ${uncitedCount} signal${uncitedCount>1?"s have":" has"} no source URL — treat with caution`);
+      }
+
+      rec = { ...rec, account_intelligence:intel, news:d.news||[] };
       const lvls = [rec.meta.confidence.overview,rec.meta.confidence.locations,rec.meta.confidence.stakeholders,rec.meta.confidence.economics];
       rec.meta.confidence.overall = lvls.includes("low")?"low":lvls.filter(l=>l==="high").length>=2?"high":"medium";
       rec.meta.refreshed_at = new Date().toISOString();
       setCurrentRecord({...rec}); setStage(3,"done");
-      addLog(`Intelligence: ${(d.account_intelligence?.opportunity_signals||[]).length} signals · ${(d.news||[]).length} news items`);
+      addLog(`Intelligence: ${auditedSignals.length} signals (${uncitedCount} uncited) · ${(d.news||[]).length} news items`);
     } catch(e) { setStage(3,"error"); addLog(`Intelligence error: ${e.message}`); }
 
     addLog("Pipeline complete — review results and save to team.");
