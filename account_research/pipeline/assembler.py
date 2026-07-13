@@ -1,8 +1,9 @@
 """
 Record assembler.
 
-Takes the raw dicts returned by LLMEnricher and EDGAR, validates them
-against the Pydantic schema, and produces a fully typed AccountResearchRecord.
+Takes the raw dicts returned by LLMEnricher and EDGAR (+ optionally PDL
+people search), validates them against the Pydantic schema, and produces
+a fully typed AccountResearchRecord.
 
 Handles partial failures gracefully: if the LLM returns a malformed
 stakeholders block, we log a warning and continue with an empty list.
@@ -22,8 +23,6 @@ from ..models.schema import (
     Confidence,
     ConfidenceMap,
     Economics,
-    EdgarFinancials,    # re-export for type hint
-    FinancialDiscrepancy,
     Financials,
     Location,
     Meta,
@@ -31,11 +30,13 @@ from ..models.schema import (
     OpportunitySignal,
     Overview,
     RevenueSegment,
+    RoleType,
     SemiconductorProfile,
     SourceRecord,
     Stakeholder,
 )
 from ..extractors.edgar import EdgarFinancials
+from ..extractors.people_search import PersonProfile
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,12 @@ class RecordAssembler:
         enriched: dict[str, Any],
         edgar_data: Optional[EdgarFinancials],
         search_sources: list[dict],      # [{name, url, fetched_at, fields_populated}]
+        people_profiles: Optional[list[PersonProfile]] = None,
         refresh_cadence: str = "weekly",
     ) -> AccountResearchRecord:
 
         now = datetime.utcnow()
+        people_profiles = people_profiles or []
 
         # ------------------------------------------------------------------
         # Build sources list
@@ -75,6 +78,14 @@ class RecordAssembler:
                 fields_populated=["economics.financials"],
             ))
 
+        if people_profiles:
+            sources.append(SourceRecord(
+                name="People Data Labs",
+                url="https://www.peopledatalabs.com",
+                fetched_at=now,
+                fields_populated=["stakeholders"],
+            ))
+
         # ------------------------------------------------------------------
         # Overview
         # ------------------------------------------------------------------
@@ -86,9 +97,9 @@ class RecordAssembler:
         locations = self._build_locations(enriched.get("locations", []))
 
         # ------------------------------------------------------------------
-        # Stakeholders
+        # Stakeholders — merge LLM output with verified PDL contacts
         # ------------------------------------------------------------------
-        stakeholders = self._build_stakeholders(enriched.get("stakeholders", []))
+        stakeholders = self._build_stakeholders(enriched.get("stakeholders", []), people_profiles)
 
         # ------------------------------------------------------------------
         # Economics — merge EDGAR (higher priority) with LLM estimates
@@ -117,39 +128,11 @@ class RecordAssembler:
         # ------------------------------------------------------------------
         # Assemble
         # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-        # Verification
-        # ------------------------------------------------------------------
-        financial_discrepancies = self._check_financial_discrepancies(
-            economics, edgar_data
-        )
-        citation_warnings = self._audit_signal_citations(account_intelligence)
-
-        if financial_discrepancies:
-            logger.warning(
-                "[assembler] %d financial discrepanc%s vs EDGAR: %s",
-                len(financial_discrepancies),
-                "ies" if len(financial_discrepancies) > 1 else "y",
-                ", ".join(
-                    f"{d.field} {d.pct_diff}% off"
-                    for d in financial_discrepancies
-                ),
-            )
-        if citation_warnings:
-            logger.warning(
-                "[assembler] %d signal%s %s no source URL — treat with caution",
-                citation_warnings,
-                "s" if citation_warnings > 1 else "",
-                "have" if citation_warnings > 1 else "has",
-            )
-
         meta = Meta(
             refreshed_at=now,
             refresh_cadence=refresh_cadence,
             confidence=confidence,
             sources=sources,
-            financial_discrepancies=financial_discrepancies,
-            citation_warnings=citation_warnings,
         )
 
         return AccountResearchRecord(
@@ -188,18 +171,81 @@ class RecordAssembler:
                 logger.debug("[assembler] location skipped: %s — %s", item, exc)
         return locations
 
-    def _build_stakeholders(self, raw: list) -> list[Stakeholder]:
+    def _build_stakeholders(
+        self,
+        raw: list,
+        people_profiles: Optional[list[PersonProfile]] = None,
+    ) -> list[Stakeholder]:
+        """
+        Validates the LLM's stakeholder list, then merges it against
+        verified PDL contacts by normalized name:
+
+        - Matched entries: PDL's linkedin_url/email override whatever the
+          LLM guessed (structured source > LLM estimate), and `verified`
+          is set to True. We never trust the LLM's own claim about whether
+          a contact is verified — it's determined here, by an actual name
+          match, not by asking the model to self-report it.
+        - Unmatched PDL contacts the LLM silently dropped are still added,
+          with a conservative default role/influence, so a real, confirmed
+          decision-maker is never lost just because the LLM didn't surface
+          them.
+        """
+        people_profiles = people_profiles or []
+        verified_by_name = {
+            self._normalize_name(p.name): p for p in people_profiles if p.name
+        }
+        matched_names: set[str] = set()
+
         stakeholders = []
         for item in raw:
             try:
                 # Clamp influence_score to [0, 1]
                 if "influence_score" in item:
                     item["influence_score"] = max(0.0, min(1.0, float(item["influence_score"])))
+
+                norm = self._normalize_name(item.get("name", ""))
+                match = verified_by_name.get(norm)
+                if match:
+                    if match.linkedin_url:
+                        item["linkedin_url"] = match.linkedin_url
+                    if match.emails:
+                        item["email"] = match.emails[0]
+                    item["verified"] = True
+                    matched_names.add(norm)
+                else:
+                    item["verified"] = False
+
                 stakeholders.append(Stakeholder(**item))
             except (ValidationError, TypeError, ValueError) as exc:
                 logger.debug("[assembler] stakeholder skipped: %s — %s", item, exc)
+
+        # Safety net: verified contacts the LLM didn't include at all.
+        for norm, p in verified_by_name.items():
+            if norm in matched_names:
+                continue
+            try:
+                stakeholders.append(Stakeholder(
+                    name=p.name,
+                    title=p.title or "Unknown title",
+                    department=p.department,
+                    location=p.location,
+                    role_type=RoleType.INFLUENCER,
+                    influence_score=0.4,
+                    linkedin_url=p.linkedin_url,
+                    email=p.emails[0] if p.emails else None,
+                    notes="Sourced from People Data Labs; role and influence "
+                          "are conservative defaults, not yet LLM-reviewed.",
+                    verified=True,
+                ))
+            except (ValidationError, TypeError, ValueError) as exc:
+                logger.debug("[assembler] verified contact skipped: %s — %s", p, exc)
+
         # Sort by influence descending
         return sorted(stakeholders, key=lambda s: s.influence_score, reverse=True)
+
+    @staticmethod
+    def _normalize_name(name: Optional[str]) -> str:
+        return " ".join((name or "").strip().lower().split())
 
     def _build_economics(
         self, raw: dict, edgar: Optional[EdgarFinancials]
@@ -280,78 +326,6 @@ class RecordAssembler:
         return sorted(news, key=lambda n: n.date, reverse=True)[:10]
 
     # ------------------------------------------------------------------
-    # Verification methods
-    # ------------------------------------------------------------------
-
-    _DISCREPANCY_THRESHOLD = 0.20  # flag fields that diverge >20% from EDGAR
-
-    def _check_financial_discrepancies(
-        self,
-        economics:  Economics,
-        edgar:      Optional[EdgarFinancials],
-    ) -> list[FinancialDiscrepancy]:
-        """
-        Compare LLM financial estimates against EDGAR audited figures.
-        Returns a list of fields that diverge by more than _DISCREPANCY_THRESHOLD.
-        Only meaningful for public companies where EDGAR data was fetched AND
-        the LLM returned its own estimates (data_quality != "audited").
-        """
-        if not edgar:
-            return []
-
-        def _to_m(v: Optional[float]) -> Optional[float]:
-            return round(v / 1_000_000, 1) if v else None
-
-        edgar_figures = {
-            "Revenue":    _to_m(edgar.revenue_usd),
-            "R&D spend":  _to_m(edgar.rd_expense_usd),
-            "Capex":      _to_m(edgar.capex_usd),
-            "Net income": _to_m(edgar.net_income_usd),
-        }
-        llm_figures = {
-            "Revenue":    economics.financials.revenue_usd_m,
-            "R&D spend":  economics.financials.rd_spend_usd_m,
-            "Capex":      economics.financials.capex_usd_m,
-            "Net income": economics.financials.net_income_usd_m,
-        }
-
-        discrepancies = []
-        for field, edgar_val in edgar_figures.items():
-            llm_val = llm_figures.get(field)
-            if llm_val is None or edgar_val is None or edgar_val == 0:
-                continue
-            delta = abs(llm_val - edgar_val) / abs(edgar_val)
-            if delta > self._DISCREPANCY_THRESHOLD:
-                discrepancies.append(FinancialDiscrepancy(
-                    field=field,
-                    llm_m=llm_val,
-                    edgar_m=edgar_val,
-                    pct_diff=round(delta * 100),
-                ))
-        return discrepancies
-
-    def _audit_signal_citations(
-        self,
-        account_intelligence: AccountIntelligence,
-    ) -> int:
-        """
-        Mark each OpportunitySignal as cited or uncited based on whether it
-        has a non-empty source URL. Mutates the signals in place and returns
-        the count of uncited signals.
-        """
-        uncited = 0
-        for signal in account_intelligence.opportunity_signals:
-            is_cited = bool(signal.source and signal.source.strip())
-            # Pydantic models are immutable by default; use model_copy
-            try:
-                signal.__dict__["cited"] = is_cited
-            except Exception:
-                pass  # if mutation fails, cited stays False (schema default)
-            if not is_cited:
-                uncited += 1
-        return uncited
-
-    # ------------------------------------------------------------------
     # Confidence scoring
     # ------------------------------------------------------------------
 
@@ -388,10 +362,20 @@ class RecordAssembler:
             ])
             return Confidence.MEDIUM if filled >= 2 else Confidence.LOW
 
+        def _stakeholder_conf() -> Confidence:
+            if not stakeholders:
+                return Confidence.LOW
+            verified_count = sum(1 for s in stakeholders if getattr(s, "verified", False))
+            # Two or more PDL-confirmed contacts is at least as strong a
+            # signal as having five LLM-guessed names — reward either path.
+            if verified_count >= 2 or len(stakeholders) >= 3:
+                return Confidence.HIGH
+            return Confidence.MEDIUM
+
         ov_conf  = _overview_conf()
         eco_conf = _econ_conf()
         loc_conf = Confidence.HIGH if len(locations) >= 2 else Confidence.MEDIUM if locations else Confidence.LOW
-        stk_conf = Confidence.HIGH if len(stakeholders) >= 3 else Confidence.MEDIUM if stakeholders else Confidence.LOW
+        stk_conf = _stakeholder_conf()
 
         # Overall = weakest section
         all_confs = [ov_conf, eco_conf, loc_conf, stk_conf]

@@ -13,6 +13,13 @@ Environment variables required:
     SEARCH_API_KEY      — your Serper / Brave / SerpAPI key
     SEARCH_PROVIDER     — "serper" | "brave" | "serpapi"  (default: serper)
 
+Environment variables optional:
+    PDL_API_KEY         — People Data Labs key, for verified stakeholder
+                          contacts (free tier: 1,000 records/mo, no card
+                          required — https://www.peopledatalabs.com).
+                          If unset, stakeholders are LLM-inferred from web
+                          snippets only, same as before this stage existed.
+
 Output:
     ./output/<company>_<timestamp>.json          — full structured record
     ./output/<company>_<timestamp>_summary.md    — human-readable one-pager

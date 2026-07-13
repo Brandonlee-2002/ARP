@@ -10,6 +10,11 @@ Environment variables:
     ANTHROPIC_API_KEY   — required
     SEARCH_API_KEY      — required (for web search)
     SEARCH_PROVIDER     — "serper" | "brave" | "serpapi"  (default: serper)
+    PDL_API_KEY         — optional (for verified stakeholder contacts via
+                          People Data Labs). If unset, the people-search
+                          stage is skipped and stakeholders fall back to
+                          pure LLM inference from web snippets, same as
+                          before this stage existed.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import anthropic
 
 from ..extractors.edgar import EdgarExtractor
 from ..extractors.llm_enricher import LLMEnricher
+from ..extractors.people_search import PeopleSearchExtractor, PersonProfile
 from ..extractors.web_search import WebSearchExtractor
 from ..models.schema import AccountResearchRecord
 from .assembler import RecordAssembler
@@ -36,11 +42,12 @@ class AccountResearchPipeline:
     """
     Orchestrates the full research pipeline:
 
-        1. Web search  — broad multi-query scrape across all topics
-        2. EDGAR       — audited financials for public companies
-        3. LLM enrich  — section-by-section structured extraction
-        4. Assemble    — validate, merge, score confidence
-        5. Save        — write JSON + summary to disk
+        1. Web search    — broad multi-query scrape across all topics
+        2. EDGAR         — audited financials for public companies
+        3. People search — verified decision-maker contacts (optional, PDL)
+        4. LLM enrich    — section-by-section structured extraction
+        5. Assemble      — validate, merge, score confidence
+        6. Save          — write JSON + summary to disk
 
     All stages are independently fault-tolerant.
     """
@@ -50,6 +57,7 @@ class AccountResearchPipeline:
         anthropic_client: anthropic.Anthropic,
         search_api_key:   str,
         search_provider:  str = "serper",
+        pdl_api_key:      Optional[str] = None,
     ):
         self._llm       = LLMEnricher(client=anthropic_client)
         self._web       = WebSearchExtractor(
@@ -57,6 +65,7 @@ class AccountResearchPipeline:
             provider=search_provider,
         )
         self._edgar     = EdgarExtractor()
+        self._people    = PeopleSearchExtractor(api_key=pdl_api_key) if pdl_api_key else None
         self._assembler = RecordAssembler()
 
     # ------------------------------------------------------------------
@@ -69,6 +78,7 @@ class AccountResearchPipeline:
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         search_key    = os.environ.get("SEARCH_API_KEY")
         provider      = os.environ.get("SEARCH_PROVIDER", "serper")
+        pdl_key       = os.environ.get("PDL_API_KEY")  # optional — stage skipped if unset
 
         if not anthropic_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable not set")
@@ -79,6 +89,7 @@ class AccountResearchPipeline:
             anthropic_client=anthropic.Anthropic(api_key=anthropic_key),
             search_api_key=search_key,
             search_provider=provider,
+            pdl_api_key=pdl_key,
         )
 
     # ------------------------------------------------------------------
@@ -111,7 +122,7 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         # Stage 1: Web search
         # ------------------------------------------------------------------
-        logger.info("[Stage 1/4] Web search...")
+        logger.info("[Stage 1/5] Web search...")
         search_results = self._web.fetch_all(company_name, domain)
         logger.info("  → %d search snippets collected", len(search_results))
 
@@ -122,7 +133,7 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         edgar_data = None
         if ticker:
-            logger.info("[Stage 2/4] EDGAR lookup for ticker %s...", ticker)
+            logger.info("[Stage 2/5] EDGAR lookup for ticker %s...", ticker)
             edgar_data = self._edgar.fetch(ticker)
             if edgar_data:
                 logger.info(
@@ -133,29 +144,46 @@ class AccountResearchPipeline:
             else:
                 logger.info("  → No EDGAR data found (private company or foreign issuer)")
         else:
-            logger.info("[Stage 2/4] Skipping EDGAR (no ticker provided)")
+            logger.info("[Stage 2/5] Skipping EDGAR (no ticker provided)")
 
         # ------------------------------------------------------------------
-        # Stage 3: LLM enrichment
+        # Stage 3: People search (optional — requires PDL_API_KEY)
         # ------------------------------------------------------------------
-        logger.info("[Stage 3/4] LLM enrichment (6 sections)...")
+        people_profiles: list[PersonProfile] = []
+        if self._people:
+            logger.info("[Stage 3/5] People search (PDL)...")
+            try:
+                people_profiles = self._people.search(company_name, domain)
+                logger.info("  → %d verified contact(s) found", len(people_profiles))
+            except Exception as exc:
+                logger.warning("  → People search failed, continuing without it: %s", exc)
+                people_profiles = []
+        else:
+            logger.info("[Stage 3/5] Skipping people search (no PDL_API_KEY set)")
+
+        # ------------------------------------------------------------------
+        # Stage 4: LLM enrichment
+        # ------------------------------------------------------------------
+        logger.info("[Stage 4/5] LLM enrichment (6 sections)...")
         enriched = self._llm.enrich(
             company_name=company_name,
             domain=domain,
             search_results=search_results,
             edgar_data=edgar_data,
+            people_profiles=people_profiles,
         )
 
         # ------------------------------------------------------------------
-        # Stage 4: Assemble and validate
+        # Stage 5: Assemble and validate
         # ------------------------------------------------------------------
-        logger.info("[Stage 4/4] Assembling and validating record...")
+        logger.info("[Stage 5/5] Assembling and validating record...")
         record = self._assembler.assemble(
             company_name=company_name,
             domain=domain,
             enriched=enriched,
             edgar_data=edgar_data,
             search_sources=search_sources,
+            people_profiles=people_profiles,
             refresh_cadence=refresh_cadence,
         )
 
@@ -232,7 +260,8 @@ class AccountResearchPipeline:
             return f"${v:,.0f}M" if v else "N/A"
 
         stakeholder_lines = "\n".join(
-            f"  - **{s.name}** ({s.title}) — {s.role_type} | influence: {s.influence_score:.0%}"
+            f"  - **{s.name}**{' ✓' if getattr(s, 'verified', False) else ''} "
+            f"({s.title}) — {s.role_type} | influence: {s.influence_score:.0%}"
             for s in r.stakeholders[:6]
         )
 
@@ -259,6 +288,11 @@ class AccountResearchPipeline:
             for seg in r.economics.revenue_segments
         )
 
+        verified_count = sum(1 for s in r.stakeholders if getattr(s, "verified", False))
+        stakeholder_note = (
+            f" ({verified_count} verified via People Data Labs)" if verified_count else ""
+        )
+
         return f"""# Account research: {ov.legal_name}
 *Generated: {r.meta.refreshed_at.strftime("%Y-%m-%d %H:%M UTC")} | Confidence: {r.meta.confidence.overall} | Schema v{r.meta.schema_version}*
 
@@ -280,7 +314,7 @@ class AccountResearchPipeline:
 
 ---
 
-## Stakeholder map
+## Stakeholder map{stakeholder_note}
 {stakeholder_lines or "  None identified"}
 
 ---
@@ -321,52 +355,8 @@ class AccountResearchPipeline:
 
 ---
 
-## Verification
-{self._render_verification(r)}
-
----
-
 *Sources: {", ".join(s.name for s in r.meta.sources[:5])}{"..." if len(r.meta.sources) > 5 else ""}*
 """
-
-    # ------------------------------------------------------------------
-    # Verification renderer
-    # ------------------------------------------------------------------
-
-    def _render_verification(self, r: AccountResearchRecord) -> str:
-        """
-        Renders a concise verification summary for the Markdown one-pager.
-        Shows financial discrepancies vs EDGAR and citation warnings.
-        """
-        lines = []
-
-        discrepancies = r.meta.financial_discrepancies
-        if discrepancies:
-            lines.append("**⚠ Financial discrepancies vs EDGAR audited filing:**")
-            for d in discrepancies:
-                lines.append(
-                    f"  - **{d.field}**: LLM estimated ${d.llm_m:,.0f}M vs "
-                    f"EDGAR audited ${d.edgar_m:,.0f}M ({d.pct_diff}% off) — "
-                    f"use EDGAR figure"
-                )
-        else:
-            lines.append("✓ No financial discrepancies detected vs EDGAR")
-
-        citation_warnings = r.meta.citation_warnings
-        total_signals = len(r.account_intelligence.opportunity_signals)
-        cited = total_signals - citation_warnings
-        if citation_warnings > 0:
-            lines.append(
-                f"**⚠ Citation check**: {cited}/{total_signals} signals have a "
-                f"source URL — {citation_warnings} signal"
-                f"{'s are' if citation_warnings > 1 else ' is'} unverified"
-            )
-        elif total_signals > 0:
-            lines.append(f"✓ All {total_signals} signals have source URLs")
-        else:
-            lines.append("✓ No signals to audit")
-
-        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Internal helpers

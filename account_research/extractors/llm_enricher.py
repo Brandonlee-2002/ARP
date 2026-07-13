@@ -1,14 +1,18 @@
 """
 LLM enrichment layer.
 
-Takes raw text chunks from web search + EDGAR and uses Claude to
-extract structured data matching the AccountResearchRecord schema.
+Takes raw text chunks from web search + EDGAR (+ optionally PDL people
+search) and uses Claude to extract structured data matching the
+AccountResearchRecord schema.
 
 Design choices:
 - One LLM call per schema section (not one giant prompt) — keeps context
   focused and makes partial failures recoverable.
 - Each call returns JSON only; we validate with Pydantic before merging.
 - System prompt is minimal; all schema detail goes in the user turn.
+- Where a structured source (EDGAR, PDL) exists, we hand it to the LLM as
+  ground truth rather than letting the LLM guess — it estimates only what
+  no structured source covers.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import anthropic
 
 from ..extractors.web_search import SearchResult
 from ..extractors.edgar import EdgarFinancials
+from ..extractors.people_search import PersonProfile
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +53,20 @@ class LLMEnricher:
         domain: str,
         search_results: list[SearchResult],
         edgar_data: Optional[EdgarFinancials] = None,
+        people_profiles: Optional[list[PersonProfile]] = None,
     ) -> dict[str, Any]:
         """
         Returns a dict with keys matching AccountResearchRecord sections.
         Each section is independently extracted; failures return {} for
         that section so the rest of the record still populates.
+
+        people_profiles: verified contacts from People Data Labs (optional).
+        When present, the stakeholder extraction anchors on these real
+        names/titles instead of inferring purely from search snippets.
+        Contact fields (email, linkedin_url) and the `verified` flag are
+        NOT trusted from the LLM's output here — the assembler fills those
+        in afterward by matching names against people_profiles directly,
+        so a hallucinated-looking match can't slip through.
         """
         # Group search snippets by topic for targeted prompts
         by_topic = self._group_by_topic(search_results)
@@ -63,7 +77,7 @@ class LLMEnricher:
 
         sections["overview"]      = self._extract_overview(company_name, domain, by_topic)
         sections["locations"]     = self._extract_locations(company_name, by_topic)
-        sections["stakeholders"]  = self._extract_stakeholders(company_name, by_topic)
+        sections["stakeholders"]  = self._extract_stakeholders(company_name, by_topic, people_profiles)
         sections["economics"]     = self._extract_economics(company_name, by_topic, edgar_data)
         sections["account_intelligence"] = self._extract_account_intelligence(
             company_name, raw_text_all
@@ -132,12 +146,53 @@ Put HQ first. Include at most 12 locations.
         result = self._call(prompt, section="locations", expect_list=True)
         return result if isinstance(result, list) else []
 
-    def _extract_stakeholders(self, company_name: str, by_topic: dict[str, str]) -> list:
+    @staticmethod
+    def _format_verified_people(people: list[PersonProfile]) -> str:
+        """
+        Renders confirmed contacts (from PDL) as a block to inject into
+        the stakeholder prompt, so the LLM anchors on real names/titles
+        instead of inventing similar-sounding ones from loose snippets.
+        """
+        if not people:
+            return ""
+
+        lines = []
+        for p in people:
+            bits = [p.name or "(name withheld)", p.title or "title unknown"]
+            if p.location:
+                bits.append(p.location)
+            lines.append("  - " + " — ".join(bits))
+
+        return (
+            "\nVERIFIED CONTACTS (from a people-data provider — these are "
+            "real people confirmed to currently work at this company; use "
+            "their exact name and title rather than inventing similar-"
+            "sounding ones):\n" + "\n".join(lines) + "\n"
+        )
+
+    def _extract_stakeholders(
+        self,
+        company_name: str,
+        by_topic: dict[str, str],
+        people_profiles: Optional[list[PersonProfile]] = None,
+    ) -> list:
+        people_profiles = people_profiles or []
+        verified_block = self._format_verified_people(people_profiles)
+
+        inclusion_instruction = (
+            "Include every person listed in VERIFIED CONTACTS above, using their "
+            "exact name and title. You may add a few additional people from the "
+            "web snippets only if they are clearly distinct from everyone in the "
+            "verified list and clearly relevant."
+            if people_profiles else
+            "Include 4-8 people."
+        )
+
         prompt = f"""
 Extract key stakeholders and decision-makers for "{company_name}" who would be
 relevant to a semiconductor supplier's account manager.
-
-SOURCE TEXT:
+{verified_block}
+SOURCE TEXT (web search snippets):
 {by_topic.get("stakeholders", "(no stakeholder snippets found)")}
 
 Return a JSON array. Each person must have EXACTLY these fields:
@@ -162,7 +217,8 @@ Role guidance for semiconductor sales:
 - executive_sponsor: approves strategic supplier list (CTO, CSO)
 - gatekeeper: controls vendor qualification process
 
-Include 4-8 people. Set influence_score based on role (economic_buyer 0.8-1.0,
+{inclusion_instruction}
+Set influence_score based on role (economic_buyer 0.8-1.0,
 technical_buyer 0.6-0.8, executive_sponsor 0.5-0.7, others 0.3-0.6).
 """
         result = self._call(prompt, section="stakeholders", expect_list=True)

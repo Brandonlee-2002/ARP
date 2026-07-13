@@ -1,0 +1,158 @@
+{
+  "data": [
+    {
+      "name": "shankar ratneshwaran",
+      "title": "head, solutions center of excellence - artificial intelligence and cloud",
+      "job_title_role": "engineering",
+      "job_title_levels": [
+        "director"
+      ],
+      "department": "devops",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/sratneshwaran",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "david raske",
+      "title": "head of public safety & security segment",
+      "job_title_role": "manufacturing",
+      "job_title_levels": [
+        "director"
+      ],
+      "department": "health_and_safety",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/davidraske",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "jes\u00fas moreno",
+      "title": "it finance director - sap s / 4 program leader",
+      "job_title_role": "finance",
+      "job_title_levels": [
+        "director",
+        "manager"
+      ],
+      "department": null,
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/jessemorenocpa",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "mary brett",
+      "title": "senior director, okr execution and culture",
+      "job_title_role": null,
+      "job_title_levels": [
+        "senior",
+        "director"
+      ],
+      "department": null,
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/marybrett",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "stacy song",
+      "title": "director, it strategic sourcing - entersprise software / saas",
+      "job_title_role": "engineering",
+      "job_title_levels": [
+        "director"
+      ],
+      "department": "software",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/stacy-song-8b420145",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "susie capozza",
+      "title": "global account director, world wide technology",
+      "job_title_role": null,
+      "job_title_levels": [
+        "director"
+      ],
+      "department": null,
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/susiecapozza",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "todd manley",
+      "title": "vice president, corporate development integration",
+      "job_title_role": "operations",
+      "job_title_levels": [
+        "vp"
+      ],
+      "department": "corporate_development",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/toddmanley",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "ajay mungara",
+      "title": "senior director, ai solution engineering enabling and innovation, intel datacenter",
+      "job_title_role": "engineering",
+      "job_title_levels": [
+        "senior",
+        "director"
+      ],
+      "department": "hardware",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/amungara",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "colin helms",
+      "title": "desktop segment design director",
+      "job_title_role": "creative",
+      "job_title_levels": [
+        "director"
+      ],
+      "department": "graphic_design",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/colin-helms",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    },
+    {
+      "name": "jagan kandi",
+      "title": "director of analog hardware engineering",
+      "job_title_role": "engineering",
+      "job_title_levels": [
+        "director"
+      ],
+      "department": "hardware",
+      "location": "united states",
+      "linkedin_url": "linkedin.com/in/jagan-kr",
+      "emails": [],
+      "phone_numbers": [],
+      "company_name": "intel",
+      "pdl_likelihood": null
+    }
+  ],
+  "mock": false
+}
