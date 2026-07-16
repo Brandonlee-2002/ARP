@@ -1,5 +1,5 @@
 """
-Pydantic models for the account research schema v1.0.0.
+Pydantic models for the account research schema v1.1.0.
 Each model maps 1:1 to the JSON schema defined in the design phase.
 """
 
@@ -130,7 +130,7 @@ class ConfidenceMap(BaseModel):
 
 
 class Meta(BaseModel):
-    schema_version:  str            = "1.0.0"
+    schema_version:  str            = "1.1.0"
     record_id:       str            = Field(default_factory=lambda: str(uuid.uuid4()))
     created_at:      datetime       = Field(default_factory=datetime.utcnow)
     refreshed_at:    datetime       = Field(default_factory=datetime.utcnow)

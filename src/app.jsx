@@ -150,9 +150,9 @@ const sigBr = t => ({opportunity:"var(--border-success)",risk:"var(--border-dang
 // ── API ────────────────────────────────────────────────────────
 const SYS = `You are a semiconductor sales intelligence extractor. Return ONLY valid JSON. Use null for unknowns. Never fabricate specific numbers. data_quality: "audited"|"estimated"|"inferred".`;
 
-async function apiCall(prompt, webSearch = false) {
+async function apiCall(prompt, webSearch = false, maxTokens = 2000) {
   const body = {
-    model: MODEL, max_tokens: 2000, system: SYS,
+    model: MODEL, max_tokens: maxTokens, system: SYS,
     messages: [{ role: "user", content: prompt }],
   };
   if (webSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
@@ -173,7 +173,7 @@ async function apiCall(prompt, webSearch = false) {
 const runOverview = (co, domain, ticker) => apiCall(
 `Research "${co}" (domain:${domain}${ticker?", ticker:"+ticker:""}). Return JSON with exactly these two keys:
 {"overview":{"legal_name":string,"doing_business_as":string|null,"ticker":{"symbol":string,"exchange":string}|null,"ownership_type":"public"|"private"|"subsidiary"|"jv"|"government","parent_company":string|null,"founded_year":integer|null,"website":string,"industry_verticals":[string],"employee_count":{"value":integer,"approximate":boolean}|null,"summary":"3-4 sentences covering what they do, market position, and relevance to a semiconductor supplier","competitors":[string],"key_products":[string]},"locations":[{"type":"hq"|"regional_hq"|"fab"|"assembly"|"rd_center"|"design_center"|"sales_office","name":string|null,"city":string,"state_region":string|null,"country":string,"country_code":"2-letter ISO","status":"active"|"ramping"|"under_construction"|"planned"|"closed","notes":string|null}]}
-HQ first. Max 10 locations. For semiconductor companies distinguish fab sites from offices.`, true);
+HQ first. Max 10 locations. For semiconductor companies distinguish fab sites from offices.`, true, 4096);
 
 const runEconomics = (co, ticker) => apiCall(
 `Financial and semiconductor data for "${co}"${ticker?" (ticker:"+ticker+")":"(private company)"}. Return JSON:
@@ -245,6 +245,13 @@ ${news||"| — | — | — |"}
 function toHtmlReport(r) {
   const ov = r.overview||{}, f = r.economics?.financials||{}, semi = r.economics?.semiconductor_profile||{}, intel = r.account_intelligence||{};
   const esc = s => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  // Browsers suggest the <title> (sanitized) as the default filename in the
+  // Save-as-PDF print dialog. Build something filesystem-friendly here
+  // rather than the raw display title — mirrors the Python pipeline's
+  // `<slug>_<date>` output naming so a PDF and its JSON/summary counterpart
+  // are easy to tell apart on disk.
+  const pdfDate = new Date().toISOString().slice(0, 10);
+  const pdfFileTitle = `${slug(ov.legal_name || r.company_name).replace(/_+$/, "")}_account_research_${pdfDate}`;
   const val = v => `<span style="color:#111">${esc(v||"—")}</span>`;
   const badge = (text, color="#555", bg="#f0f0f0") => `<span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;background:${bg};color:${color};font-weight:500;white-space:nowrap">${esc(text)}</span>`;
   const sigColor = t => ({opportunity:["#166534","#f0fdf4","#bbf7d0"],risk:["#991b1b","#fff1f1","#fecaca"],watch:["#92400e","#fffbeb","#fde68a"]}[t]||["#555","#f9f9f9","#e5e7eb"]);
@@ -305,7 +312,7 @@ function toHtmlReport(r) {
     ["Market Cap", fmtM(f.market_cap_usd_m), ""],
   ];
 
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${esc(ov.legal_name||r.company_name)} — Account Intelligence</title>
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${esc(pdfFileTitle)}</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;font-size:14px;line-height:1.5}
@@ -370,22 +377,26 @@ function toHtmlReport(r) {
 
   <div class="footer">Account Research Pipeline v1.0.0 · Generated ${fmtD(r.meta?.refreshed_at||new Date())}</div>
 </body></html>`;
+
+  return { html, filename: pdfFileTitle };
 }
 
-function openPdfReport(r) {
-  const html = toHtmlReport(r);
-  // Use a blob URL — works inside sandboxed iframes where window.open("","_blank") is blocked
+function downloadHtmlReport(r) {
+  const { html, filename } = toHtmlReport(r);
+  // Artifacts run in a sandboxed iframe, so target="_blank" can't actually
+  // open a real new tab — Chrome silently falls back to downloading the
+  // blob instead, using a generic name ("download.html") if we don't set
+  // one explicitly. Setting `download` here is what actually controls the
+  // saved filename; target/rel do nothing once `download` is present.
   const blob = new Blob([html], { type: "text/html" });
   const url  = URL.createObjectURL(blob);
   const a    = Object.assign(document.createElement("a"), {
-    href:   url,
-    target: "_blank",
-    rel:    "noopener noreferrer",
+    href:     url,
+    download: `${filename}.html`,
   });
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  // Revoke after a short delay so the new tab has time to load
   setTimeout(() => URL.revokeObjectURL(url), 10000);
   return true;
 }
@@ -947,8 +958,8 @@ function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete
           <button onClick={async()=>{await copyToClipboard(JSON.stringify(record,null,2));onToast("JSON copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
             <i className="ti ti-clipboard-data" style={{fontSize:13}}/>Copy JSON
           </button>
-          <button onClick={()=>{openPdfReport(record);onToast("PDF opened — use Ctrl+P to save");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-            <i className="ti ti-printer" style={{fontSize:13}}/>Save PDF
+          <button onClick={()=>{downloadHtmlReport(record);onToast("Downloaded — open the file, then press Ctrl+P to save as PDF");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+            <i className="ti ti-download" style={{fontSize:13}}/>Download report
           </button>
           <DeleteButton onDelete={()=>onDelete(record.meta.record_id)}/>
         </div>

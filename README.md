@@ -1,40 +1,30 @@
-# Account Research Pipeline
+# Account research pipeline
 
 Automated company research for semiconductor account managers. Given a company name, domain, and optional stock ticker, the pipeline produces a structured JSON record and a human-readable Markdown one-pager covering headquarters, office locations, stakeholder map, financials, and account intelligence signals.
 
 ---
 
-## Screenshots
+## Changelog
 
-### Research form
-Enter a company name, website domain, and optional stock ticker to start a run.
+### v1.1.0 — 2026-07-16
 
-![Research form](assets/01_form.png)
+**Added**
+- **People search integration (People Data Labs)** — new optional `extractors/people_search.py` module. When `PDL_API_KEY` is set, a new Stage 3 looks up verified decision-maker contacts (name, title, LinkedIn, email) before LLM enrichment. These verified contacts anchor the stakeholder-extraction prompt — Claude uses their real names/titles instead of inferring purely from search snippets. Fully optional and backward-compatible: if `PDL_API_KEY` is unset, this stage is skipped and behavior is identical to v1.0.0.
+- **`verified` field on `Stakeholder`** (schema) — boolean, defaults to `false`. True only when a stakeholder was matched against a structured source (currently PDL) by name, rather than purely LLM-inferred. The match — and any resulting override of `linkedin_url`/`email` — happens in `assembler.py`, not by trusting the LLM's own say-so.
+- Verified PDL contacts the LLM fails to surface are still included via a safety net in the assembler, with a conservative default role (`influencer`, 0.4 influence) rather than being silently dropped.
+- `meta.sources` now includes a `"People Data Labs"` entry whenever the people-search stage runs.
 
-### Pipeline running
-Four stages execute in sequence — each independently fault-tolerant so a failed web search doesn't block the rest of the run.
+**Changed**
+- Stakeholder confidence scoring: now also reaches `HIGH` when 2+ verified contacts are present, not only when 3+ total (previously unverified-vs-verified counted the same).
+- `_render_summary()`: stakeholder lines show a ✓ marker for verified contacts.
+- Pipeline stage count/logging: 4 stages → 5 (Web search → EDGAR → People search → LLM enrich → Assemble).
 
-![Pipeline running](assets/02_pipeline.png)
+**Fixed**
+- `assembler.py` import bug: `EdgarFinancials` was imported from `models.schema` (which never defined it) immediately before being correctly re-imported from `extractors.edgar`. The first import raised `ImportError` on every run before ever reaching the second — pre-existing, unrelated to the people-search work, caught while wiring in the new extractor.
 
-### Results — Overview
-Company details, summary, industry verticals, and key competitors pulled from web search and structured into typed fields.
+### v1.0.0 — initial release
 
-![Overview tab](assets/03_overview.png)
-
-### Results — Economics
-Revenue, margins, R&D spend, capex, and a semiconductor-specific profile including buyer type, fab nodes, known suppliers, and supply gaps.
-
-![Economics tab](assets/04_economics.png)
-
-### Results — Account Intelligence
-Opportunity signals, risks, and watch items tagged by urgency, plus a recommended next action for the account manager.
-
-![Intelligence tab](assets/05_intelligence.png)
-
-### Markdown export
-Every record exports to a clean one-pager — ready to paste into a CRM note, email, or meeting brief.
-
-![Markdown export](assets/06_markdown.png)
+Four-stage pipeline (web search → EDGAR → LLM enrichment → assemble), JSON + Markdown output, confidence scoring.
 
 ---
 
@@ -46,15 +36,19 @@ Web search (14 queries)
         ├──► LLM extraction ──► Pydantic validation ──► AccountResearchRecord
         │         (6 sections)                                    │
 SEC EDGAR ──────────────────────────────────────────►   JSON + Markdown summary
-(audited financials, public companies only)
+(audited financials, public companies only)         ▲
+                                                      │
+People Data Labs ─────────────────────────────────────┘
+(verified stakeholder contacts, optional — requires PDL_API_KEY)
 ```
 
-Four stages run in sequence, each independently fault-tolerant:
+Five stages run in sequence, each independently fault-tolerant:
 
 1. **Web search** — fires 14 targeted queries across topics (overview, locations, stakeholders, financials, semiconductor profile, news) using Serper, Brave Search, or SerpAPI.
 2. **SEC EDGAR** — for US-listed companies, fetches audited 10-K / 20-F financials directly from EDGAR's public XBRL API. No API key required.
-3. **LLM enrichment** — Claude makes one focused call per schema section, returning JSON. EDGAR numbers override LLM estimates where both exist.
-4. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output.
+3. **People search** *(optional)* — if `PDL_API_KEY` is set, looks up verified decision-maker contacts (name, title, LinkedIn, email) via People Data Labs. Skipped entirely if the key isn't set.
+4. **LLM enrichment** — Claude makes one focused call per schema section, returning JSON. EDGAR numbers override LLM estimates where both exist; verified PDL contacts anchor the stakeholder prompt where available.
+5. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output. Verified contacts are matched by name and flagged `verified: true`; any the LLM drops are still included via a safety net.
 
 ---
 
@@ -68,14 +62,14 @@ output/
   intel_corporation_20260624_143201_summary.md     # one-pager for deal review / CRM
 ```
 
-The JSON record follows a versioned schema (`v1.0.0`) with these top-level sections:
+The JSON record follows a versioned schema (`v1.1.0`) with these top-level sections:
 
 | Section | What it contains |
 |---|---|
 | `meta` | Schema version, timestamps, per-section confidence scores, source citations |
 | `overview` | Legal name, ticker, founding year, headcount, industry verticals, summary |
 | `locations` | HQ, fabs, R&D centers, sales offices — typed and status-tagged |
-| `stakeholders` | Decision-makers with role type, influence score, and buying relevance notes |
+| `stakeholders` | Decision-makers with role type, influence score, buying relevance notes, and a `verified` flag (true when matched against People Data Labs rather than purely LLM-inferred) |
 | `economics` | Revenue, margins, R&D spend, capex, segment breakdown, semiconductor profile |
 | `account_intelligence` | Opportunity signals, risks, watch items, recommended next action |
 | `news` | Up to 10 recent items tagged by topic |
@@ -96,9 +90,12 @@ pip install anthropic httpx pydantic
 export ANTHROPIC_API_KEY="sk-ant-..."
 export SEARCH_API_KEY="your-key-here"
 export SEARCH_PROVIDER="serper"        # serper | brave | serpapi
+export PDL_API_KEY="your-pdl-key"      # optional — enables verified stakeholder contacts
 ```
 
 Serper (`serper.dev`) is recommended — roughly $0.001 per query, so a full pipeline run costs under $0.02 in search fees.
+
+`PDL_API_KEY` is optional. [People Data Labs](https://www.peopledatalabs.com) offers a free tier (1,000 records/month, no credit card) that's normally enough for regular use. Without it, the pipeline behaves exactly as in v1.0.0 — stakeholders are inferred entirely from web search snippets.
 
 ### 3. Run
 
@@ -188,6 +185,7 @@ account_research/
 ├── extractors/
 │   ├── web_search.py        # Multi-query web search (Serper / Brave / SerpAPI)
 │   ├── edgar.py             # SEC EDGAR XBRL financials (free, no key)
+│   ├── people_search.py     # People Data Labs verified contacts (optional, free tier)
 │   └── llm_enricher.py      # Section-by-section Claude extraction
 │
 └── pipeline/
@@ -253,7 +251,7 @@ The `economics.semiconductor_profile` section is purpose-built for semiconductor
 
 ## Extending the pipeline
 
-**Add a new data source** — implement a new extractor in `extractors/`, call it from `pipeline.py` in the run sequence, and pass its output to `assembler.py`. The assembler's merge logic follows the pattern: structured source > LLM estimate > null.
+**Add a new data source** — implement a new extractor in `extractors/`, call it from `pipeline.py` in the run sequence, and pass its output to `assembler.py`. The assembler's merge logic follows the pattern: structured source > LLM estimate > null. `extractors/people_search.py` is a working example of this pattern — see how `pipeline.py` treats it as fully optional (skipped if `PDL_API_KEY` is unset) and how `assembler.py`'s `_build_stakeholders()` merges its output by name.
 
 **Add a new schema field** — add the field to the relevant Pydantic model in `models/schema.py`, add it to the corresponding LLM prompt in `llm_enricher.py`, and handle it in `assembler.py`.
 
