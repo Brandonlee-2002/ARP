@@ -2,9 +2,27 @@
 
 Automated company research for semiconductor account managers. Given a company name, domain, and optional stock ticker, the pipeline produces a structured JSON record and a human-readable Markdown one-pager covering headquarters, office locations, stakeholder map, financials, and account intelligence signals.
 
+**This project ships as two independent, standalone implementations — you only need one, not both:**
+
+| | Python pipeline (this README, below) | `app.jsx` ([details](#browser-based-interface-appjsx)) |
+|---|---|---|
+| **Best for** | People comfortable with a terminal | Anyone — no setup required |
+| **Runs** | From the command line | In the browser, as a self-contained artifact |
+| **Setup** | Install deps, set API keys as env vars | None — open it and go |
+| **Output** | JSON + Markdown files on disk | In-app dashboard, editable, downloadable HTML |
+| **Good for** | Scripting, batch runs, CRM pipelines | Quick, one-off, interactive research |
+
+They produce the same kind of research output but share no code — pick whichever fits how you want to work.
+
 ---
 
 ## Changelog
+
+### v1.1.1 — 2026-07-20
+
+**Fixed**
+- `llm_enricher.py`'s `_call()` used a plain `json.loads()` with no defense beyond stripping markdown fences. If Claude appended any trailing content after the JSON closed (or occasionally leading preamble beyond a fence), parsing failed outright. Replaced with a balanced-bracket scanner (`_extract_json()`) that finds exactly where the JSON value ends — correctly skipping over brackets and quotes inside string literals — and ignores anything before or after it. Ported from the same fix in `app.jsx`, where this exact failure mode was first observed and reproduced.
+- Raised `MAX_TOKENS` from 2048 to 4096 across all six section calls, as a defensive margin against truncation on data-heavy responses (e.g. a company with many locations or stakeholders). Note: this repo's calls are already split one-section-per-call, so the specific *combined-schema* truncation bug found in `app.jsx` (where Overview + Locations shared one 2000-token response) doesn't structurally apply here — this is a precautionary increase, not a confirmed-bug fix like the one above.
 
 ### v1.1.0 — 2026-07-16
 
@@ -28,7 +46,37 @@ Four-stage pipeline (web search → EDGAR → LLM enrichment → assemble), JSON
 
 ---
 
+## Browser-based interface (app.jsx)
+
+The more user-friendly of the two options — no terminal, no installation, no API keys to manage yourself. A parallel, self-contained implementation of this same research capability exists as a single-file React artifact (`app.jsx`). It calls the Claude API directly from the browser using its own `web_search` tool calls, rather than this repo's Python backend (Serper/Brave/SerpAPI + EDGAR). **It does not use `account_research/`** — it's a separate, independent codebase solving the same problem through a different interface, intended for quick, no-install research sessions inside a Claude Project or artifact rather than a scripted/scheduled pipeline run.
+
+### Features
+
+- The same four-stage research flow (overview + locations → economics → stakeholders → account intelligence), rendered as a dashboard of saved accounts with a sidebar and a tabbed results view.
+- **Manual editing** — every section except revenue segments and news is editable in place (Edit → Apply changes → Save), with add/remove for locations, stakeholders, and opportunity signals.
+- **Delete accounts** — click-to-arm confirmation rather than a native `confirm()` dialog, since those are frequently blocked inside the sandboxed iframe artifacts run in.
+- **Re-saving a company you've already researched replaces the old profile** instead of creating a duplicate — matched by domain, not by the internal record ID (which is always freshly generated per run).
+- **Download report** — generates a standalone HTML file with a filesystem-safe name derived from company + date; open it and use your browser's Ctrl+P → Save as PDF to get an actual PDF.
+
+### Recent fixes
+
+- **JSON parsing**: `web_search`-enabled responses sometimes have Claude append a trailing sentence after the JSON closes (e.g. "I found these on the investor relations page"). The previous `JSON.parse` + greedy-regex fallback failed outright when this happened. Replaced with a balanced-bracket scanner that finds exactly where the JSON value ends — correctly skipping over brackets and quotes inside string literals — and ignores anything Claude appends afterward.
+- **Response truncation**: the Overview and Account Intelligence calls each bundle several schema sections into a single response, but were capped at the same token limit as the smaller calls. Raised individually for those two after both were observed truncating mid-JSON on data-heavy companies.
+- **"New research" no longer discards progress mid-run** — clicking it while a pipeline is actively executing now shows the live stage tracker instead of hiding it behind a blank form. (Once a run finishes, the app already force-navigates to the results view regardless of where you're browsing; this only closes the gap during the in-progress window.)
+- **PDF download was silently producing an empty, misnamed file** (`undefined.html`, no content) due to an unreachable code path in the report generator. Fixed and verified by actually executing the function, not just checking that it parses.
+- **Ticker was accidentally non-editable** in edit mode — grouped in with the (correctly) read-only Domain/Website fields despite having no bearing on how a saved account is matched on re-save. Split into separate Symbol/Exchange fields; clearing both reverts the company to "Private" rather than leaving a hollow object behind.
+
+### Known limitations
+
+- No search/filter box for saved accounts, and no one-click "re-run research for this account" button. Both were prototyped and then removed while troubleshooting an unrelated issue, and haven't been reintroduced since — manual editing was the one feature from that round of work that was kept.
+- Revenue segments and the News tab are read-only even in edit mode.
+- No timeout or elapsed-time indicator on individual API calls, so a slow-but-working response (e.g. researching a company with a thin public semiconductor footprint) currently looks identical to a hung one.
+
+---
+
 ## How it works
+
+The more technical of the two options — runs from a terminal, needs your own API keys, and writes output to disk. Good fit if you're comfortable with the command line and want scripting/batch-run flexibility.
 
 ```
 Web search (14 queries)

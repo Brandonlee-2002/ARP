@@ -77,6 +77,20 @@ const CSS = `
   input:focus { border-color: var(--border-accent); }
   input::placeholder { color: var(--text-muted); }
 
+  select, textarea {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    background: var(--surface-1);
+    border: 0.5px solid var(--border-strong);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    padding: 8px 12px;
+    outline: none;
+    transition: border-color .15s;
+  }
+  select:focus, textarea:focus { border-color: var(--border-accent); }
+  textarea { font-family: inherit; resize: vertical; line-height: 1.5; }
+
   button {
     font-family: var(--font-sans);
     font-size: 13px;
@@ -150,6 +164,43 @@ const sigBr = t => ({opportunity:"var(--border-success)",risk:"var(--border-dang
 // ── API ────────────────────────────────────────────────────────
 const SYS = `You are a semiconductor sales intelligence extractor. Return ONLY valid JSON. Use null for unknowns. Never fabricate specific numbers. data_quality: "audited"|"estimated"|"inferred".`;
 
+// Finds the first complete JSON value (object or array) in `text` by
+// scanning for balanced brackets, correctly skipping over string contents
+// (so braces/brackets inside quoted strings don't throw off the depth
+// count, and escaped quotes don't prematurely end a string). Returns the
+// exact substring for that value — ignoring any leading preamble *and*
+// any trailing prose Claude appended after the JSON closes (e.g. "I found
+// these from Qualcomm's investor relations page."), which a plain
+// greedy regex match can't distinguish from part of the JSON itself.
+// Returns null if the brackets never balance (e.g. a genuinely truncated
+// response) — the caller's own JSON.parse then surfaces that failure.
+function extractJson(text) {
+  const start = text.search(/[[{]/);
+  if (start === -1) return null;
+
+  const openChar = text[start];
+  const closeChar = openChar === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escapeNext) { escapeNext = false; continue; }
+    if (ch === "\\" && inString) { escapeNext = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === openChar) depth++;
+    else if (ch === closeChar) {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 async function apiCall(prompt, webSearch = false, maxTokens = 2000) {
   const body = {
     model: MODEL, max_tokens: maxTokens, system: SYS,
@@ -163,9 +214,10 @@ async function apiCall(prompt, webSearch = false, maxTokens = 2000) {
   const d = await r.json();
   const text = d.content.filter(b => b.type === "text").map(b => b.text).join("");
   const clean = text.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim();
-  try { return JSON.parse(clean); } catch {
-    const m = clean.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-    if (m) return JSON.parse(m[0]);
+  try {
+    const extracted = extractJson(clean);
+    return JSON.parse(extracted !== null ? extracted : clean);
+  } catch {
     throw new Error("JSON parse failed");
   }
 }
@@ -188,7 +240,7 @@ economic_buyer=0.8-1.0, technical_buyer=0.6-0.8. Prioritize: procurement VP, CTO
 const runIntelligence = (co) => apiCall(
 `Semiconductor supplier account intelligence for "${co}". Return JSON:
 {"account_intelligence":{"opportunity_signals":[{"type":"opportunity"|"risk"|"watch","description":"1-2 actionable sentences","urgency":"immediate"|"near_term"|"long_term","source":string|null}],"recommended_next_action":string|null,"current_supplier_status":"no_relationship"|"evaluation"|"approved_vendor"|"active_account"|"strategic_partner"},"news":[{"date":"YYYY-MM-DD","headline":string,"summary":string|null,"source_name":string,"url":string|null,"tags":[string]}]}
-3-5 signals covering expansion plans, qualification cycles, competitive risks. 5-7 news items.`, true);
+3-5 signals covering expansion plans, qualification cycles, competitive risks. 5-7 news items.`, true, 4096);
 
 // ── Export ─────────────────────────────────────────────────────
 function toMarkdown(r) {
@@ -312,7 +364,7 @@ function toHtmlReport(r) {
     ["Market Cap", fmtM(f.market_cap_usd_m), ""],
   ];
 
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${esc(pdfFileTitle)}</title>
+  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${esc(pdfFileTitle)}</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;font-size:14px;line-height:1.5}
@@ -479,6 +531,70 @@ function FieldRow({ label, value, mono }) {
   );
 }
 
+// ── Editable-field atoms ────────────────────────────────────────
+// Used by every section's edit mode. Each renders a labeled row: plain
+// text when read-only, a real input when editable — so section components
+// only need one branch rather than duplicating markup for both states.
+function EditRow({ label, children }) {
+  return (
+    <div style={{padding:"6px 0",borderBottom:"0.5px solid var(--border)"}}>
+      <label style={{display:"block",fontSize:11,color:"var(--text-muted)",marginBottom:4}}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, editable, type="text", mono, options=[] }) {
+  if (!editable) {
+    const display = type==="list" ? (Array.isArray(value)?value.join(", "):value) : value;
+    return <FieldRow label={label} value={display} mono={mono}/>;
+  }
+  return (
+    <EditRow label={label}>
+      {type==="select" ? (
+        <select value={value||""} onChange={e=>onChange(e.target.value)} style={{width:"100%"}}>
+          {options.map(o=><option key={o} value={o}>{o.replace(/_/g," ")}</option>)}
+        </select>
+      ) : type==="number" ? (
+        <input type="number" step="any" value={value ?? ""} placeholder="—"
+          onChange={e=>onChange(e.target.value===""?null:Number(e.target.value))}
+          style={{width:"100%",fontFamily:mono?"var(--font-mono)":undefined}}/>
+      ) : type==="checkbox" ? (
+        <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer"}}>
+          <input type="checkbox" checked={!!value} onChange={e=>onChange(e.target.checked)} style={{width:"auto"}}/>
+          {value ? "Yes" : "No"}
+        </label>
+      ) : type==="list" ? (
+        <input value={Array.isArray(value)?value.join(", "):(value||"")} placeholder="Comma-separated"
+          onChange={e=>onChange(e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
+          style={{width:"100%"}}/>
+      ) : type==="textarea" ? (
+        <textarea value={value||""} onChange={e=>onChange(e.target.value)} style={{width:"100%",minHeight:70}}/>
+      ) : (
+        <input value={value||""} onChange={e=>onChange(e.target.value)}
+          style={{width:"100%",fontFamily:mono?"var(--font-mono)":undefined}}/>
+      )}
+    </EditRow>
+  );
+}
+
+function RemoveRowButton({ onClick, title="Remove" }) {
+  return (
+    <button onClick={(e)=>{e.stopPropagation(); onClick();}} title={title}
+      style={{fontSize:11,padding:"3px 7px",display:"flex",alignItems:"center",gap:4,color:"var(--text-danger)",background:"transparent",borderColor:"var(--border)",flexShrink:0}}>
+      <i className="ti ti-x" style={{fontSize:13}}/>
+    </button>
+  );
+}
+
+function AddRowButton({ onClick, label }) {
+  return (
+    <button onClick={onClick} style={{fontSize:12,padding:"6px 12px",display:"flex",alignItems:"center",gap:6,justifyContent:"center",width:"100%",borderStyle:"dashed"}}>
+      <i className="ti ti-plus" style={{fontSize:13}}/>{label}
+    </button>
+  );
+}
+
 // ── Pipeline tracker ───────────────────────────────────────────
 function PipelineTracker({ statuses }) {
   return (
@@ -517,45 +633,83 @@ function PipelineTracker({ statuses }) {
 }
 
 // ── Tab sections ───────────────────────────────────────────────
-function OverviewSection({ r }) {
+function OverviewSection({ r, editable, onChange }) {
   const ov = r.overview||{};
+  const set = (field, value) => onChange(d => { d.overview = d.overview || {}; d.overview[field] = value; });
+  const setTicker = (field, value) => onChange(d => {
+    d.overview = d.overview || {};
+    const current = d.overview.ticker || { symbol: "", exchange: "" };
+    const updated = { ...current, [field]: value };
+    // Revert to null (i.e. "Private") once both symbol and exchange are cleared,
+    // rather than leaving a hollow {symbol:"", exchange:""} object behind.
+    d.overview.ticker = (updated.symbol || updated.exchange) ? updated : null;
+  });
   return (
     <div style={{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:16}}>
       <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
         <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>Company details</p>
-        <FieldRow label="Legal name"  value={ov.legal_name}/>
-        <FieldRow label="DBA"         value={ov.doing_business_as}/>
-        <FieldRow label="Ticker"      value={ov.ticker?`${ov.ticker.symbol}:${ov.ticker.exchange}`:(r.ticker||"Private")} mono/>
-        <FieldRow label="Ownership"   value={ov.ownership_type}/>
-        <FieldRow label="Parent"      value={ov.parent_company}/>
-        <FieldRow label="Founded"     value={ov.founded_year}/>
-        <FieldRow label="Employees"   value={ov.employee_count?`~${Number(ov.employee_count.value).toLocaleString()}`:null}/>
+        <Field label="Legal name"  value={ov.legal_name}        editable={editable} onChange={v=>set('legal_name',v)}/>
+        <Field label="DBA"         value={ov.doing_business_as} editable={editable} onChange={v=>set('doing_business_as',v)}/>
+        {editable ? (
+          <>
+            <Field label="Ticker symbol"   value={ov.ticker?.symbol||""}   editable onChange={v=>setTicker('symbol',v)} mono/>
+            <Field label="Ticker exchange" value={ov.ticker?.exchange||""} editable onChange={v=>setTicker('exchange',v)} mono/>
+          </>
+        ) : (
+          <FieldRow label="Ticker"      value={ov.ticker?`${ov.ticker.symbol}:${ov.ticker.exchange}`:(r.ticker||"Private")} mono/>
+        )}
+        <Field label="Ownership"   value={ov.ownership_type} editable={editable} type="select"
+          options={["public","private","subsidiary","jv","government"]} onChange={v=>set('ownership_type',v)}/>
+        <Field label="Parent"     value={ov.parent_company} editable={editable} onChange={v=>set('parent_company',v)}/>
+        <Field label="Founded"    value={ov.founded_year}   editable={editable} type="number" onChange={v=>set('founded_year',v)}/>
+        {editable ? (
+          <Field label="Employees" value={ov.employee_count?.value} type="number" editable
+            onChange={v=>set('employee_count', v==null?null:{...(ov.employee_count||{approximate:true}), value:v})}/>
+        ) : (
+          <FieldRow label="Employees" value={ov.employee_count?`~${Number(ov.employee_count.value).toLocaleString()}`:null}/>
+        )}
         <FieldRow label="Domain"      value={r.domain||null} mono/>
         <FieldRow label="Website"     value={ov.website} mono/>
       </div>
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
         <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
           <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>Summary</p>
-          <p style={{fontSize:13,lineHeight:1.65,color:"var(--text-primary)",margin:0}}>{ov.summary||"—"}</p>
+          {editable ? (
+            <textarea value={ov.summary||""} onChange={e=>set('summary',e.target.value)} style={{width:"100%",minHeight:90}}/>
+          ) : (
+            <p style={{fontSize:13,lineHeight:1.65,color:"var(--text-primary)",margin:0}}>{ov.summary||"—"}</p>
+          )}
         </div>
         <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
           <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>Industry</p>
-          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
-            {(ov.industry_verticals||[]).map(v=><Badge key={v}>{v}</Badge>)}
-            {!(ov.industry_verticals||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
-          </div>
-          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>Key competitors</p>
-          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
-            {(ov.competitors||[]).map(c=><Badge key={c}>{c}</Badge>)}
-            {!(ov.competitors||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
-          </div>
+          {editable ? (
+            <input value={(ov.industry_verticals||[]).join(", ")} placeholder="Comma-separated, e.g. semiconductors, IDM"
+              onChange={e=>set('industry_verticals', e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
+              style={{width:"100%",marginBottom:12}}/>
+          ) : (
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+              {(ov.industry_verticals||[]).map(v=><Badge key={v}>{v}</Badge>)}
+              {!(ov.industry_verticals||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
+            </div>
+          )}
+          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8,marginTop:editable?10:0}}>Key competitors</p>
+          {editable ? (
+            <input value={(ov.competitors||[]).join(", ")} placeholder="Comma-separated"
+              onChange={e=>set('competitors', e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
+              style={{width:"100%"}}/>
+          ) : (
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {(ov.competitors||[]).map(c=><Badge key={c}>{c}</Badge>)}
+              {!(ov.competitors||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function LocationsSection({ r }) {
+function LocationsSection({ r, editable, onChange }) {
   const typeMeta = {
     hq:           {bg:"var(--bg-pro)",    color:"var(--text-pro)"},
     fab:          {bg:"var(--bg-danger)", color:"var(--text-danger)"},
@@ -572,7 +726,44 @@ function LocationsSection({ r }) {
     planned:            {bg:"var(--bg-neutral)", color:"var(--text-secondary)"},
     closed:             {bg:"var(--surface-1)",  color:"var(--text-muted)"},
   };
+  const locationTypes = ["hq","regional_hq","fab","assembly","rd_center","design_center","sales_office","warehouse"];
+  const statusOptions = ["active","ramping","under_construction","planned","closed"];
   const locs = r.locations||[];
+
+  const setField = (i, field, value) => onChange(d => { d.locations[i][field] = value; });
+  const removeAt = (i) => onChange(d => { d.locations.splice(i,1); });
+  const addLocation = () => onChange(d => {
+    d.locations = d.locations || [];
+    d.locations.push({ type:"sales_office", city:"New city", country:"", status:"active", notes:null });
+  });
+
+  if (editable) {
+    return (
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {locs.map((loc,i) => (
+          <div key={i} style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"0.85rem 1rem"}}>
+            <div style={{display:"flex",justifyContent:"flex-end",marginBottom:6}}>
+              <RemoveRowButton onClick={()=>removeAt(i)} title="Remove this location"/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <Field label="Type" value={loc.type} editable type="select" options={locationTypes} onChange={v=>setField(i,'type',v)}/>
+              <Field label="Status" value={loc.status} editable type="select" options={statusOptions} onChange={v=>setField(i,'status',v)}/>
+              <Field label="City" value={loc.city} editable onChange={v=>setField(i,'city',v)}/>
+              <Field label="Country" value={loc.country} editable onChange={v=>setField(i,'country',v)}/>
+              <Field label="Name" value={loc.name} editable onChange={v=>setField(i,'name',v)}/>
+              <Field label="State / region" value={loc.state_region} editable onChange={v=>setField(i,'state_region',v)}/>
+            </div>
+            <div style={{marginTop:8}}>
+              <label style={{display:"block",fontSize:11,color:"var(--text-muted)",marginBottom:4}}>Notes</label>
+              <input value={loc.notes||""} onChange={e=>setField(i,'notes',e.target.value)} style={{width:"100%"}}/>
+            </div>
+          </div>
+        ))}
+        <AddRowButton onClick={addLocation} label="Add location"/>
+      </div>
+    );
+  }
+
   return (
     <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,overflow:"hidden"}}>
       {locs.map((loc,i) => {
@@ -594,9 +785,44 @@ function LocationsSection({ r }) {
   );
 }
 
-function StakeholdersSection({ r }) {
+function StakeholdersSection({ r, editable, onChange }) {
   const roleColor = {economic_buyer:"var(--bg-danger)",technical_buyer:"var(--bg-accent)",executive_sponsor:"var(--bg-pro)",champion:"var(--bg-success)",influencer:"var(--bg-warning)",gatekeeper:"var(--surface-1)"};
   const roleText  = {economic_buyer:"var(--text-danger)",technical_buyer:"var(--text-accent)",executive_sponsor:"var(--text-pro)",champion:"var(--text-success)",influencer:"var(--text-warning)",gatekeeper:"var(--text-secondary)"};
+  const roleTypes = ["economic_buyer","technical_buyer","executive_sponsor","champion","influencer","gatekeeper"];
+
+  const setField = (i, field, value) => onChange(d => { d.stakeholders[i][field] = value; });
+  const removeAt = (i) => onChange(d => { d.stakeholders.splice(i,1); });
+  const addStakeholder = () => onChange(d => {
+    d.stakeholders = d.stakeholders || [];
+    d.stakeholders.push({ name:"New stakeholder", title:"", role_type:"influencer", influence_score:0.5, notes:null });
+  });
+
+  if (editable) {
+    const stks = r.stakeholders||[];
+    return (
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
+          {stks.map((s,i) => (
+            <div key={i} style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem",display:"flex",flexDirection:"column",gap:8}}>
+              <div style={{display:"flex",justifyContent:"flex-end"}}>
+                <RemoveRowButton onClick={()=>removeAt(i)} title="Remove this stakeholder"/>
+              </div>
+              <Field label="Name" value={s.name} editable onChange={v=>setField(i,'name',v)}/>
+              <Field label="Title" value={s.title} editable onChange={v=>setField(i,'title',v)}/>
+              <Field label="Department" value={s.department} editable onChange={v=>setField(i,'department',v)}/>
+              <Field label="Location" value={s.location} editable onChange={v=>setField(i,'location',v)}/>
+              <Field label="Role" value={s.role_type} editable type="select" options={roleTypes} onChange={v=>setField(i,'role_type',v)}/>
+              <Field label="Influence (0.0–1.0)" value={s.influence_score} editable type="number"
+                onChange={v=>setField(i,'influence_score', v==null?0:Math.max(0,Math.min(1,v)))}/>
+              <Field label="Notes" value={s.notes} editable type="textarea" onChange={v=>setField(i,'notes',v)}/>
+            </div>
+          ))}
+        </div>
+        <AddRowButton onClick={addStakeholder} label="Add stakeholder"/>
+      </div>
+    );
+  }
+
   return (
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>
       {(r.stakeholders||[]).map((s,i) => {
@@ -626,10 +852,59 @@ function StakeholdersSection({ r }) {
   );
 }
 
-function EconomicsSection({ r }) {
+function EconomicsSection({ r, editable, onChange }) {
   const f    = r.economics?.financials||{};
   const semi = r.economics?.semiconductor_profile||{};
   const segs = r.economics?.revenue_segments||[];
+
+  const setFin  = (field, value) => onChange(d => { d.economics = d.economics||{}; d.economics.financials = {...(d.economics.financials||{}), [field]: value}; });
+  const setSemi = (field, value) => onChange(d => { d.economics = d.economics||{}; d.economics.semiconductor_profile = {...(d.economics.semiconductor_profile||{}), [field]: value}; });
+
+  if (editable) {
+    return (
+      <div style={{display:"flex",flexDirection:"column",gap:16}}>
+        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
+          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>Financials</p>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:0}}>
+            <Field label="Fiscal year"     value={f.fiscal_year}          editable type="number" onChange={v=>setFin('fiscal_year',v)}/>
+            <Field label="Data quality"    value={f.data_quality}         editable type="select" options={["audited","estimated","inferred"]} onChange={v=>setFin('data_quality',v)}/>
+            <Field label="Revenue ($M)"    value={f.revenue_usd_m}        editable type="number" onChange={v=>setFin('revenue_usd_m',v)}/>
+            <Field label="YoY growth (%)"  value={f.revenue_growth_pct}   editable type="number" onChange={v=>setFin('revenue_growth_pct',v)}/>
+            <Field label="Gross margin (%)"value={f.gross_margin_pct}     editable type="number" onChange={v=>setFin('gross_margin_pct',v)}/>
+            <Field label="R&D spend ($M)"  value={f.rd_spend_usd_m}       editable type="number" onChange={v=>setFin('rd_spend_usd_m',v)}/>
+            <Field label="R&D (% of rev)"  value={f.rd_pct_revenue}       editable type="number" onChange={v=>setFin('rd_pct_revenue',v)}/>
+            <Field label="Capex ($M)"      value={f.capex_usd_m}          editable type="number" onChange={v=>setFin('capex_usd_m',v)}/>
+            <Field label="Market cap ($M)" value={f.market_cap_usd_m}     editable type="number" onChange={v=>setFin('market_cap_usd_m',v)}/>
+          </div>
+        </div>
+        {segs.length>0 && (
+          <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
+            <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:4}}>Revenue segments</p>
+            <p style={{fontSize:11,color:"var(--text-muted)",marginBottom:10}}>Not editable yet — edit financials above, or delete and re-run research to regenerate segments.</p>
+            {segs.map((seg,i) => (
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 0",borderBottom:i<segs.length-1?"0.5px solid var(--border)":"none",gap:8}}>
+                <span style={{fontSize:13,flex:1,color:"var(--text-muted)"}}>{seg.name}</span>
+                <span style={{fontSize:13,color:"var(--text-muted)"}}>{fmtM(seg.revenue_usd_m)} ({Number(seg.pct_of_total||0).toFixed(0)}%)</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
+          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>Semiconductor profile</p>
+          <Field label="Buyer type" value={semi.chip_buyer_type} editable type="select"
+            options={["fabless","fab_lite","idc","ems","oem_buyer_only"]} onChange={v=>setSemi('chip_buyer_type',v)}/>
+          <Field label="Has own fab" value={semi.has_own_fab} editable type="checkbox" onChange={v=>setSemi('has_own_fab',v)}/>
+          <Field label="Fab nodes" value={semi.fab_nodes} editable type="list" onChange={v=>setSemi('fab_nodes',v)}/>
+          <Field label="Known suppliers" value={semi.known_chip_suppliers} editable type="list" onChange={v=>setSemi('known_chip_suppliers',v)}/>
+          <Field label="Supply gaps" value={semi.known_supply_gaps} editable type="list" onChange={v=>setSemi('known_supply_gaps',v)}/>
+          <Field label="Est. chip spend ($M)" value={semi.annual_chip_spend_est_usd_m} editable type="number" onChange={v=>setSemi('annual_chip_spend_est_usd_m',v)}/>
+          <Field label="Qualification cycle" value={semi.qualification_cycle} editable type="textarea" onChange={v=>setSemi('qualification_cycle',v)}/>
+          <Field label="Design win notes" value={semi.design_win_notes} editable type="textarea" onChange={v=>setSemi('design_win_notes',v)}/>
+        </div>
+      </div>
+    );
+  }
+
   const metrics = [
     ["Revenue",     fmtM(f.revenue_usd_m),   `FY${f.fiscal_year||"N/A"}`],
     ["YoY growth",  fmtP(f.revenue_growth_pct),""],
@@ -690,9 +965,49 @@ function EconomicsSection({ r }) {
   );
 }
 
-function IntelligenceSection({ r }) {
+function IntelligenceSection({ r, editable, onChange }) {
   const intel = r.account_intelligence||{};
   const sigs  = intel.opportunity_signals||[];
+  const statusOptions = ["no_relationship","evaluation","approved_vendor","active_account","strategic_partner"];
+  const sigTypes = ["opportunity","risk","watch"];
+  const urgencyOptions = ["immediate","near_term","long_term"];
+
+  const setIntel = (field, value) => onChange(d => { d.account_intelligence = {...(d.account_intelligence||{}), [field]: value}; });
+  const setSignal = (i, field, value) => onChange(d => { d.account_intelligence.opportunity_signals[i][field] = value; });
+  const removeSignal = (i) => onChange(d => { d.account_intelligence.opportunity_signals.splice(i,1); });
+  const addSignal = () => onChange(d => {
+    d.account_intelligence = d.account_intelligence || {};
+    d.account_intelligence.opportunity_signals = d.account_intelligence.opportunity_signals || [];
+    d.account_intelligence.opportunity_signals.push({ type:"watch", description:"", urgency:"near_term", source:null });
+  });
+
+  if (editable) {
+    return (
+      <div style={{display:"flex",flexDirection:"column",gap:16}}>
+        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
+          <Field label="Supplier status" value={intel.current_supplier_status} editable type="select" options={statusOptions} onChange={v=>setIntel('current_supplier_status',v)}/>
+          <Field label="Recommended next action" value={intel.recommended_next_action} editable type="textarea" onChange={v=>setIntel('recommended_next_action',v)}/>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {sigs.map((sig,i) => (
+            <div key={i} style={{background:sigB(sig.type),border:`0.5px solid ${sigBr(sig.type)}`,borderRadius:12,padding:"0.85rem 1rem"}}>
+              <div style={{display:"flex",justifyContent:"flex-end",marginBottom:6}}>
+                <RemoveRowButton onClick={()=>removeSignal(i)} title="Remove this signal"/>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:8}}>
+                <Field label="Type" value={sig.type} editable type="select" options={sigTypes} onChange={v=>setSignal(i,'type',v)}/>
+                <Field label="Urgency" value={sig.urgency} editable type="select" options={urgencyOptions} onChange={v=>setSignal(i,'urgency',v)}/>
+              </div>
+              <Field label="Description" value={sig.description} editable type="textarea" onChange={v=>setSignal(i,'description',v)}/>
+              <Field label="Source" value={sig.source} editable onChange={v=>setSignal(i,'source',v)}/>
+            </div>
+          ))}
+          <AddRowButton onClick={addSignal} label="Add signal"/>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
@@ -920,16 +1235,46 @@ function PipelineView({ stageStatuses, currentRecord, log }) {
 }
 
 // ── Results view ───────────────────────────────────────────────
-function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete, onToast }) {
-  const ov   = record.overview||{};
-  const conf = record.meta?.confidence||{};
+function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete, onUpdateRecord, onToast }) {
+  const [editMode, setEditMode] = useState(false);
+  const [draft, setDraft] = useState(record);
+
+  // Reset the draft whenever we switch to viewing a different account —
+  // discards any in-progress, un-applied edits.
+  useEffect(() => {
+    setDraft(record);
+    setEditMode(false);
+  }, [record.meta.record_id]);
+
+  const updateDraft = (mutator) => {
+    setDraft(prev => {
+      const next = structuredClone(prev);
+      mutator(next);
+      return next;
+    });
+  };
+
+  const applyEdits = () => {
+    onUpdateRecord(draft);
+    setEditMode(false);
+    onToast("Changes applied — click Save to persist");
+  };
+
+  const cancelEdits = () => {
+    setDraft(record);
+    setEditMode(false);
+  };
+
+  const displayRecord = editMode ? draft : record;
+  const ov   = displayRecord.overview||{};
+  const conf = displayRecord.meta?.confidence||{};
   const content = {
-    overview:     <OverviewSection     r={record}/>,
-    locations:    <LocationsSection    r={record}/>,
-    stakeholders: <StakeholdersSection r={record}/>,
-    economics:    <EconomicsSection    r={record}/>,
-    intelligence: <IntelligenceSection r={record}/>,
-    news:         <NewsSection         r={record}/>,
+    overview:     <OverviewSection     r={displayRecord} editable={editMode} onChange={updateDraft}/>,
+    locations:    <LocationsSection    r={displayRecord} editable={editMode} onChange={updateDraft}/>,
+    stakeholders: <StakeholdersSection r={displayRecord} editable={editMode} onChange={updateDraft}/>,
+    economics:    <EconomicsSection    r={displayRecord} editable={editMode} onChange={updateDraft}/>,
+    intelligence: <IntelligenceSection r={displayRecord} editable={editMode} onChange={updateDraft}/>,
+    news:         <NewsSection         r={displayRecord}/>,
   };
   return (
     <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
@@ -949,21 +1294,43 @@ function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete
         </div>
         <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",flexShrink:0}}>
           <Badge bg={confB(conf.overall)} color={confC(conf.overall)}>{conf.overall||"medium"} confidence</Badge>
-          <button onClick={onSave} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-            <i className="ti ti-bookmark" style={{fontSize:13}}/>Save
-          </button>
-          <button onClick={async()=>{await copyToClipboard(toMarkdown(record));onToast("Markdown copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-            <i className="ti ti-clipboard" style={{fontSize:13}}/>Copy Markdown
-          </button>
-          <button onClick={async()=>{await copyToClipboard(JSON.stringify(record,null,2));onToast("JSON copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-            <i className="ti ti-clipboard-data" style={{fontSize:13}}/>Copy JSON
-          </button>
-          <button onClick={()=>{downloadHtmlReport(record);onToast("Downloaded — open the file, then press Ctrl+P to save as PDF");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-            <i className="ti ti-download" style={{fontSize:13}}/>Download report
-          </button>
-          <DeleteButton onDelete={()=>onDelete(record.meta.record_id)}/>
+          {editMode ? (
+            <>
+              <button onClick={applyEdits} className="primary" style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-check" style={{fontSize:13}}/>Apply changes
+              </button>
+              <button onClick={cancelEdits} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-x" style={{fontSize:13}}/>Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              <button onClick={()=>setEditMode(true)} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-pencil" style={{fontSize:13}}/>Edit
+              </button>
+              <button onClick={onSave} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-bookmark" style={{fontSize:13}}/>Save
+              </button>
+              <button onClick={async()=>{await copyToClipboard(toMarkdown(record));onToast("Markdown copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-clipboard" style={{fontSize:13}}/>Copy Markdown
+              </button>
+              <button onClick={async()=>{await copyToClipboard(JSON.stringify(record,null,2));onToast("JSON copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-clipboard-data" style={{fontSize:13}}/>Copy JSON
+              </button>
+              <button onClick={()=>{downloadHtmlReport(record);onToast("Downloaded — open the file, then press Ctrl+P to save as PDF");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+                <i className="ti ti-download" style={{fontSize:13}}/>Download report
+              </button>
+              <DeleteButton onDelete={()=>onDelete(record.meta.record_id)}/>
+            </>
+          )}
         </div>
       </div>
+      {editMode && (
+        <div className="no-print" style={{padding:"8px 1.5rem",background:"var(--bg-accent)",borderBottom:"0.5px solid var(--border-accent)",fontSize:12,color:"var(--text-accent)",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>
+          <i className="ti ti-pencil" style={{fontSize:13}}/>
+          Editing — changes only apply to this record after you click "Apply changes", and only persist to storage after "Save".
+        </div>
+      )}
       {/* Tabs */}
       <div className="no-print" style={{display:"flex",borderBottom:"0.5px solid var(--border)",padding:"0 1.5rem",flexShrink:0,overflowX:"auto"}}>
         {TABS.map(tab => (
@@ -1108,6 +1475,28 @@ export default function App() {
     }
   };
 
+  // Commits an edited draft as the in-memory current record. Does NOT
+  // persist to storage — that still requires an explicit "Save" click,
+  // same as a freshly-generated (unsaved) record.
+  const handleUpdateRecord = (updated) => setCurrentRecord(updated);
+
+  // "New research" shouldn't erase visibility into a run that's still
+  // actively executing in the background — clicking it mid-run now shows
+  // the live pipeline progress (stage tracker + log) instead of silently
+  // discarding that view behind a blank form. Once the run finishes,
+  // runPipeline's own completion logic already force-navigates to
+  // "results" regardless of current view, so this only needs to cover
+  // the in-progress window.
+  const handleNewResearchClick = () => {
+    if (isLoading) {
+      setView("pipeline");
+    } else {
+      setView("new");
+      setError(null);
+      setForm({ company: "", domain: "", ticker: "" });
+    }
+  };
+
   return (
     <>
       <style>{CSS}</style>
@@ -1118,12 +1507,12 @@ export default function App() {
           records={records}
           activeId={view==="results"?currentRecord?.meta?.record_id:null}
           onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setView("results");}}
-          onNew={()=>{setView("new");setError(null);setForm({company:"",domain:"",ticker:""}); }}
+          onNew={handleNewResearchClick}
           onDelete={handleDelete}
         />
 
         <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-          {view==="dashboard" && <Dashboard records={records} onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setView("results");}} onNew={()=>setView("new")} onDelete={handleDelete}/>}
+          {view==="dashboard" && <Dashboard records={records} onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setView("results");}} onNew={handleNewResearchClick} onDelete={handleDelete}/>}
           {view==="new"       && <NewResearchForm form={form} onChange={setForm} onSubmit={runPipeline} error={error} isLoading={isLoading}/>}
           {view==="pipeline"  && <PipelineView stageStatuses={stageStatuses} currentRecord={currentRecord} log={log}/>}
           {view==="results" && currentRecord && (
@@ -1131,6 +1520,7 @@ export default function App() {
               onBack={()=>setView("dashboard")}
               onSave={handleSave}
               onDelete={handleDelete}
+              onUpdateRecord={handleUpdateRecord}
               onToast={showToast}/>
           )}
         </div>

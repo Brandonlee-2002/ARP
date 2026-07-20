@@ -31,7 +31,7 @@ from ..extractors.people_search import PersonProfile
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 2048
+MAX_TOKENS = 4096
 
 
 @dataclass
@@ -350,6 +350,58 @@ fab investments, chip sourcing, earnings, leadership changes, partnerships.
     # LLM call wrapper
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_json(text: str) -> Optional[str]:
+        """
+        Finds the first complete JSON value (object or array) in `text` by
+        scanning for balanced brackets, correctly skipping over string
+        contents (so braces/brackets inside quoted strings don't throw off
+        the depth count, and escaped quotes don't prematurely end a
+        string). Returns the exact substring for that value — ignoring any
+        leading preamble *and* any trailing prose the model appended after
+        the JSON closes (e.g. "Sourced from the company's investor
+        relations page."), which the previous plain `json.loads()` had no
+        defense against.
+
+        Returns None if the brackets never balance (e.g. a genuinely
+        truncated response) — the caller's own json.loads then surfaces
+        that failure rather than silently returning garbage.
+        """
+        start = None
+        for i, ch in enumerate(text):
+            if ch in "{[":
+                start = i
+                break
+        if start is None:
+            return None
+
+        open_char = text[start]
+        close_char = "}" if open_char == "{" else "]"
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == open_char:
+                depth += 1
+            elif ch == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
+
     def _call(
         self,
         user_prompt: str,
@@ -381,7 +433,8 @@ fab investments, chip sourcing, earnings, leadership changes, partnerships.
                 if raw.startswith("json"):
                     raw = raw[4:]
 
-            parsed = json.loads(raw)
+            extracted = self._extract_json(raw)
+            parsed = json.loads(extracted if extracted is not None else raw)
             logger.info("[llm] %s → ok", section)
             return parsed
 
