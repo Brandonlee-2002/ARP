@@ -1,12 +1,18 @@
 """
 Record assembler.
 
-Takes the raw dicts returned by LLMEnricher and EDGAR (+ optionally PDL
-people search), validates them against the Pydantic schema, and produces
-a fully typed AccountResearchRecord.
+Takes the raw dicts returned by LLMEnricher, EDGAR, and (optionally) People
+Data Labs, validates them against the Pydantic schema, and produces a fully
+typed AccountResearchRecord.
 
 Handles partial failures gracefully: if the LLM returns a malformed
 stakeholders block, we log a warning and continue with an empty list.
+
+Note on imports: EdgarFinancials is a dataclass defined in extractors/edgar.py
+— it is NOT defined in models/schema.py. A previous version of this file
+imported it from both places, and the first (wrong) import raised an
+ImportError before ever reaching the correct one, breaking every run. Do not
+reintroduce that import from models.schema.
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ from ..models.schema import (
     OpportunitySignal,
     Overview,
     RevenueSegment,
-    RoleType,
+    SegmentSAMEstimate,
     SemiconductorProfile,
     SourceRecord,
     Stakeholder,
@@ -39,6 +45,13 @@ from ..extractors.edgar import EdgarFinancials
 from ..extractors.people_search import PersonProfile
 
 logger = logging.getLogger(__name__)
+
+# Seniority levels PDL is asked to search for (mirrors people_search.py's
+# RELEVANT_LEVELS) — used only to pick a sensible default role/influence
+# for a verified contact the LLM never surfaced. Not used for filtering;
+# PeopleSearchExtractor already restricts results before they reach here.
+_PDL_SAFETY_NET_ROLE = "influencer"
+_PDL_SAFETY_NET_INFLUENCE = 0.4
 
 
 class RecordAssembler:
@@ -53,12 +66,12 @@ class RecordAssembler:
         enriched: dict[str, Any],
         edgar_data: Optional[EdgarFinancials],
         search_sources: list[dict],      # [{name, url, fetched_at, fields_populated}]
-        people_profiles: Optional[list[PersonProfile]] = None,
         refresh_cadence: str = "weekly",
+        pdl_contacts: Optional[list[PersonProfile]] = None,
     ) -> AccountResearchRecord:
 
         now = datetime.utcnow()
-        people_profiles = people_profiles or []
+        pdl_contacts = pdl_contacts or []
 
         # ------------------------------------------------------------------
         # Build sources list
@@ -78,7 +91,10 @@ class RecordAssembler:
                 fields_populated=["economics.financials"],
             ))
 
-        if people_profiles:
+        # meta.sources gets a People Data Labs entry whenever that stage ran,
+        # regardless of whether it actually found any contacts — this
+        # records that the lookup happened, not just that it succeeded.
+        if pdl_contacts:
             sources.append(SourceRecord(
                 name="People Data Labs",
                 url="https://www.peopledatalabs.com",
@@ -97,9 +113,9 @@ class RecordAssembler:
         locations = self._build_locations(enriched.get("locations", []))
 
         # ------------------------------------------------------------------
-        # Stakeholders — merge LLM output with verified PDL contacts
+        # Stakeholders — merges LLM output with verified PDL contacts
         # ------------------------------------------------------------------
-        stakeholders = self._build_stakeholders(enriched.get("stakeholders", []), people_profiles)
+        stakeholders = self._build_stakeholders(enriched.get("stakeholders", []), pdl_contacts)
 
         # ------------------------------------------------------------------
         # Economics — merge EDGAR (higher priority) with LLM estimates
@@ -174,27 +190,9 @@ class RecordAssembler:
     def _build_stakeholders(
         self,
         raw: list,
-        people_profiles: Optional[list[PersonProfile]] = None,
+        pdl_contacts: Optional[list[PersonProfile]] = None,
     ) -> list[Stakeholder]:
-        """
-        Validates the LLM's stakeholder list, then merges it against
-        verified PDL contacts by normalized name:
-
-        - Matched entries: PDL's linkedin_url/email override whatever the
-          LLM guessed (structured source > LLM estimate), and `verified`
-          is set to True. We never trust the LLM's own claim about whether
-          a contact is verified — it's determined here, by an actual name
-          match, not by asking the model to self-report it.
-        - Unmatched PDL contacts the LLM silently dropped are still added,
-          with a conservative default role/influence, so a real, confirmed
-          decision-maker is never lost just because the LLM didn't surface
-          them.
-        """
-        people_profiles = people_profiles or []
-        verified_by_name = {
-            self._normalize_name(p.name): p for p in people_profiles if p.name
-        }
-        matched_names: set[str] = set()
+        pdl_contacts = pdl_contacts or []
 
         stakeholders = []
         for item in raw:
@@ -202,57 +200,111 @@ class RecordAssembler:
                 # Clamp influence_score to [0, 1]
                 if "influence_score" in item:
                     item["influence_score"] = max(0.0, min(1.0, float(item["influence_score"])))
-
-                norm = self._normalize_name(item.get("name", ""))
-                match = verified_by_name.get(norm)
-                if match:
-                    if match.linkedin_url:
-                        item["linkedin_url"] = match.linkedin_url
-                    if match.emails:
-                        item["email"] = match.emails[0]
-                    item["verified"] = True
-                    matched_names.add(norm)
-                else:
-                    item["verified"] = False
-
+                item.setdefault("verified", False)
                 stakeholders.append(Stakeholder(**item))
             except (ValidationError, TypeError, ValueError) as exc:
                 logger.debug("[assembler] stakeholder skipped: %s — %s", item, exc)
 
-        # Safety net: verified contacts the LLM didn't include at all.
-        for norm, p in verified_by_name.items():
-            if norm in matched_names:
+        # ------------------------------------------------------------------
+        # Merge with PDL — structured source overrides LLM inference,
+        # following the pipeline's usual "structured > LLM estimate > null"
+        # rule. Matching is by normalized name; the LLM's own say-so about
+        # who's real is never sufficient to set verified=True.
+        # ------------------------------------------------------------------
+        matched_pdl_indices: set[int] = set()
+
+        for s in stakeholders:
+            match_idx = self._match_pdl_contact(s.name, pdl_contacts, matched_pdl_indices)
+            if match_idx is None:
+                continue
+            contact = pdl_contacts[match_idx]
+            matched_pdl_indices.add(match_idx)
+            s.verified = True
+            # Structured contact info overrides LLM-inferred (which was
+            # null/None here in practice — the LLM prompt never asks it to
+            # guess a real email or LinkedIn URL).
+            if contact.linkedin_url:
+                s.linkedin_url = contact.linkedin_url
+            if contact.emails:
+                s.email = contact.emails[0]
+            if contact.location and not s.location:
+                s.location = contact.location
+            if contact.department and not s.department:
+                s.department = contact.department
+
+        # Safety net: any verified PDL contact the LLM completely failed to
+        # surface still gets included, rather than silently dropped, with a
+        # conservative default role/influence rather than a guessed one.
+        for i, contact in enumerate(pdl_contacts):
+            if i in matched_pdl_indices or not contact.name:
                 continue
             try:
                 stakeholders.append(Stakeholder(
-                    name=p.name,
-                    title=p.title or "Unknown title",
-                    department=p.department,
-                    location=p.location,
-                    role_type=RoleType.INFLUENCER,
-                    influence_score=0.4,
-                    linkedin_url=p.linkedin_url,
-                    email=p.emails[0] if p.emails else None,
-                    notes="Sourced from People Data Labs; role and influence "
-                          "are conservative defaults, not yet LLM-reviewed.",
+                    name=contact.name,
+                    title=contact.title or "Unknown title",
+                    department=contact.department,
+                    location=contact.location,
+                    role_type=_PDL_SAFETY_NET_ROLE,
+                    influence_score=_PDL_SAFETY_NET_INFLUENCE,
+                    linkedin_url=contact.linkedin_url,
+                    email=contact.emails[0] if contact.emails else None,
+                    notes="Added from People Data Labs — not surfaced by LLM extraction.",
                     verified=True,
                 ))
             except (ValidationError, TypeError, ValueError) as exc:
-                logger.debug("[assembler] verified contact skipped: %s — %s", p, exc)
+                logger.debug("[assembler] PDL safety-net contact skipped: %s — %s", contact, exc)
 
-        # Sort by influence descending
+        # Sort by influence descending (unchanged behavior)
         return sorted(stakeholders, key=lambda s: s.influence_score, reverse=True)
 
     @staticmethod
-    def _normalize_name(name: Optional[str]) -> str:
-        return " ".join((name or "").strip().lower().split())
+    def _match_pdl_contact(
+        llm_name: str,
+        pdl_contacts: list[PersonProfile],
+        already_matched: set[int],
+    ) -> Optional[int]:
+        """
+        Matches an LLM-extracted stakeholder name against the PDL contact
+        list. Deliberately simple: normalized full-name equality first,
+        then a last-token (surname) fallback for minor formatting
+        differences (middle initials, nicknames in parens, etc.). Returns
+        the matching index in pdl_contacts, or None.
+        """
+        def _norm(s: str) -> str:
+            return " ".join((s or "").lower().replace(".", "").split())
+
+        llm_norm = _norm(llm_name)
+        if not llm_norm or "(name not found)" in llm_norm:
+            return None
+
+        # Pass 1: exact normalized match
+        for i, contact in enumerate(pdl_contacts):
+            if i in already_matched or not contact.name:
+                continue
+            if _norm(contact.name) == llm_norm:
+                return i
+
+        # Pass 2: surname match (last whitespace-separated token)
+        llm_tokens = llm_norm.split()
+        if not llm_tokens:
+            return None
+        llm_surname = llm_tokens[-1]
+        for i, contact in enumerate(pdl_contacts):
+            if i in already_matched or not contact.name:
+                continue
+            contact_tokens = _norm(contact.name).split()
+            if contact_tokens and contact_tokens[-1] == llm_surname:
+                return i
+
+        return None
 
     def _build_economics(
         self, raw: dict, edgar: Optional[EdgarFinancials]
     ) -> Economics:
-        fin_raw  = raw.get("financials", {})
-        segs_raw = raw.get("revenue_segments", [])
-        semi_raw = raw.get("semiconductor_profile", {})
+        fin_raw         = raw.get("financials", {})
+        segs_raw        = raw.get("revenue_segments", [])
+        semi_raw        = raw.get("semiconductor_profile", {})
+        segment_sam_raw = raw.get("segment_sam_estimates", [])
 
         # EDGAR overrides LLM for financial figures (audited > estimated)
         if edgar:
@@ -296,10 +348,21 @@ class RecordAssembler:
             logger.warning("[assembler] semi_profile validation error: %s", exc)
             semi_profile = SemiconductorProfile()
 
+        # Segment SAM estimates — never let a validation failure here take
+        # down the rest of economics; a missing estimate is normal (means
+        # "needs research"), so we log at debug, not warning.
+        segment_sam_estimates = []
+        for item in segment_sam_raw:
+            try:
+                segment_sam_estimates.append(SegmentSAMEstimate(**item))
+            except (ValidationError, TypeError) as exc:
+                logger.debug("[assembler] segment_sam_estimate skipped: %s — %s", item, exc)
+
         return Economics(
             financials=financials,
             revenue_segments=segments,
             semiconductor_profile=semi_profile,
+            segment_sam_estimates=segment_sam_estimates,
         )
 
     def _build_account_intelligence(self, raw: dict) -> AccountIntelligence:
@@ -340,6 +403,12 @@ class RecordAssembler:
         """
         Simple heuristic: high if key fields are populated from reliable
         sources; medium if partially populated; low if mostly empty.
+
+        Note: segment_sam_estimates deliberately does NOT factor into the
+        economics confidence score below — those estimates are benchmark-
+        derived, not disclosed, and mixing them into the audited-financials
+        confidence tier would overstate how well-founded the overall
+        economics section is.
         """
         def _overview_conf() -> Confidence:
             filled = sum([
@@ -365,10 +434,11 @@ class RecordAssembler:
         def _stakeholder_conf() -> Confidence:
             if not stakeholders:
                 return Confidence.LOW
-            verified_count = sum(1 for s in stakeholders if getattr(s, "verified", False))
-            # Two or more PDL-confirmed contacts is at least as strong a
-            # signal as having five LLM-guessed names — reward either path.
-            if verified_count >= 2 or len(stakeholders) >= 3:
+            verified_count = sum(1 for s in stakeholders if s.verified)
+            # Reaches HIGH on either 3+ total OR 2+ verified — a smaller
+            # set of PDL-confirmed contacts is at least as trustworthy as
+            # a larger set of purely LLM-inferred ones.
+            if len(stakeholders) >= 3 or verified_count >= 2:
                 return Confidence.HIGH
             return Confidence.MEDIUM
 

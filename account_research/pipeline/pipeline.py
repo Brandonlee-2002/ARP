@@ -10,11 +10,9 @@ Environment variables:
     ANTHROPIC_API_KEY   — required
     SEARCH_API_KEY      — required (for web search)
     SEARCH_PROVIDER     — "serper" | "brave" | "serpapi"  (default: serper)
-    PDL_API_KEY         — optional (for verified stakeholder contacts via
-                          People Data Labs). If unset, the people-search
-                          stage is skipped and stakeholders fall back to
-                          pure LLM inference from web snippets, same as
-                          before this stage existed.
+    PDL_API_KEY         — optional (enables verified stakeholder contacts
+                           via People Data Labs; pipeline behaves exactly
+                           as without it when unset)
 """
 
 from __future__ import annotations
@@ -30,24 +28,37 @@ import anthropic
 
 from ..extractors.edgar import EdgarExtractor
 from ..extractors.llm_enricher import LLMEnricher
-from ..extractors.people_search import PeopleSearchExtractor, PersonProfile
+from ..extractors.people_search import PeopleSearchExtractor
 from ..extractors.web_search import WebSearchExtractor
 from ..models.schema import AccountResearchRecord
 from .assembler import RecordAssembler
 
 logger = logging.getLogger(__name__)
 
+SEGMENT_LABELS = {
+    "power": "Power",
+    "ep":    "Embedded Processing",
+    "hpc":   "High-Performance Compute",
+    "conn":  "Connectivity",
+    "ams":   "Analog & Mixed-Signal",
+}
+SEGMENT_ORDER = ["power", "ep", "hpc", "conn", "ams"]
+
 
 class AccountResearchPipeline:
     """
     Orchestrates the full research pipeline:
 
-        1. Web search    — broad multi-query scrape across all topics
-        2. EDGAR         — audited financials for public companies
-        3. People search — verified decision-maker contacts (optional, PDL)
-        4. LLM enrich    — section-by-section structured extraction
-        5. Assemble      — validate, merge, score confidence
-        6. Save          — write JSON + summary to disk
+        1. Web search  — broad multi-query scrape across all topics
+        2. EDGAR       — audited financials for public companies
+        3. People search (optional) — verified decision-maker contacts via
+                          People Data Labs; skipped entirely if PDL_API_KEY
+                          isn't set
+        4. LLM enrich  — section-by-section structured extraction
+                          (includes benchmark-derived segment SAM estimates;
+                          verified contacts anchor the stakeholder prompt)
+        5. Assemble    — validate, merge, score confidence
+        6. Save        — write JSON + summary to disk
 
     All stages are independently fault-tolerant.
     """
@@ -57,7 +68,7 @@ class AccountResearchPipeline:
         anthropic_client: anthropic.Anthropic,
         search_api_key:   str,
         search_provider:  str = "serper",
-        pdl_api_key:      Optional[str] = None,
+        people_search_api_key: Optional[str] = None,
     ):
         self._llm       = LLMEnricher(client=anthropic_client)
         self._web       = WebSearchExtractor(
@@ -65,7 +76,10 @@ class AccountResearchPipeline:
             provider=search_provider,
         )
         self._edgar     = EdgarExtractor()
-        self._people    = PeopleSearchExtractor(api_key=pdl_api_key) if pdl_api_key else None
+        self._people    = (
+            PeopleSearchExtractor(api_key=people_search_api_key)
+            if people_search_api_key else None
+        )
         self._assembler = RecordAssembler()
 
     # ------------------------------------------------------------------
@@ -78,7 +92,7 @@ class AccountResearchPipeline:
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         search_key    = os.environ.get("SEARCH_API_KEY")
         provider      = os.environ.get("SEARCH_PROVIDER", "serper")
-        pdl_key       = os.environ.get("PDL_API_KEY")  # optional — stage skipped if unset
+        pdl_key       = os.environ.get("PDL_API_KEY")  # optional
 
         if not anthropic_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable not set")
@@ -89,7 +103,7 @@ class AccountResearchPipeline:
             anthropic_client=anthropic.Anthropic(api_key=anthropic_key),
             search_api_key=search_key,
             search_provider=provider,
-            pdl_api_key=pdl_key,
+            people_search_api_key=pdl_key,
         )
 
     # ------------------------------------------------------------------
@@ -149,28 +163,24 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         # Stage 3: People search (optional — requires PDL_API_KEY)
         # ------------------------------------------------------------------
-        people_profiles: list[PersonProfile] = []
+        pdl_contacts = []
         if self._people:
-            logger.info("[Stage 3/5] People search (PDL)...")
-            try:
-                people_profiles = self._people.search(company_name, domain)
-                logger.info("  → %d verified contact(s) found", len(people_profiles))
-            except Exception as exc:
-                logger.warning("  → People search failed, continuing without it: %s", exc)
-                people_profiles = []
+            logger.info("[Stage 3/5] People search (People Data Labs)...")
+            pdl_contacts = self._people.search(company_name, domain)
+            logger.info("  → %d verified contacts found", len(pdl_contacts))
         else:
-            logger.info("[Stage 3/5] Skipping people search (no PDL_API_KEY set)")
+            logger.info("[Stage 3/5] Skipping people search (PDL_API_KEY not set)")
 
         # ------------------------------------------------------------------
         # Stage 4: LLM enrichment
         # ------------------------------------------------------------------
-        logger.info("[Stage 4/5] LLM enrichment (6 sections)...")
+        logger.info("[Stage 4/5] LLM enrichment (6 sections + segment SAM)...")
         enriched = self._llm.enrich(
             company_name=company_name,
             domain=domain,
             search_results=search_results,
             edgar_data=edgar_data,
-            people_profiles=people_profiles,
+            pdl_contacts=pdl_contacts,
         )
 
         # ------------------------------------------------------------------
@@ -183,16 +193,17 @@ class AccountResearchPipeline:
             enriched=enriched,
             edgar_data=edgar_data,
             search_sources=search_sources,
-            people_profiles=people_profiles,
             refresh_cadence=refresh_cadence,
+            pdl_contacts=pdl_contacts,
         )
 
         logger.info("Pipeline complete.")
         logger.info(
-            "  Confidence: %s | Locations: %d | Stakeholders: %d | News items: %d",
+            "  Confidence: %s | Locations: %d | Stakeholders: %d (%d verified) | News items: %d",
             record.meta.confidence.overall,
             len(record.locations),
             len(record.stakeholders),
+            sum(1 for s in record.stakeholders if s.verified),
             len(record.news),
         )
 
@@ -259,9 +270,17 @@ class AccountResearchPipeline:
         def _fmt_m(v: Optional[float]) -> str:
             return f"${v:,.0f}M" if v else "N/A"
 
+        def _fmt_range(lo: Optional[float], hi: Optional[float]) -> str:
+            if lo is None and hi is None:
+                return "N/A — needs research"
+            if lo is None:
+                return f"up to {_fmt_m(hi)}"
+            if hi is None:
+                return f"{_fmt_m(lo)}+"
+            return f"{_fmt_m(lo)} – {_fmt_m(hi)}"
+
         stakeholder_lines = "\n".join(
-            f"  - **{s.name}**{' ✓' if getattr(s, 'verified', False) else ''} "
-            f"({s.title}) — {s.role_type} | influence: {s.influence_score:.0%}"
+            f"  - **{s.name}**{' ✓' if s.verified else ''} ({s.title}) — {s.role_type} | influence: {s.influence_score:.0%}"
             for s in r.stakeholders[:6]
         )
 
@@ -288,10 +307,25 @@ class AccountResearchPipeline:
             for seg in r.economics.revenue_segments
         )
 
-        verified_count = sum(1 for s in r.stakeholders if getattr(s, "verified", False))
-        stakeholder_note = (
-            f" ({verified_count} verified via People Data Labs)" if verified_count else ""
+        # Segment SAM estimates — always rendered separately from the
+        # audited financials above, with the benchmark confidence and
+        # source visible on every line so a reader never mistakes an
+        # estimate for a disclosed figure.
+        sam_lines = "\n".join(
+            f"  - **{SEGMENT_LABELS.get(est.segment, est.segment)}**: "
+            f"{_fmt_range(est.estimated_sam_low_usd_m, est.estimated_sam_high_usd_m)} "
+            f"*({est.benchmark_confidence})* — {est.unit_basis or 'no basis computed'}"
+            for est in sorted(
+                r.economics.segment_sam_estimates,
+                key=lambda e: SEGMENT_ORDER.index(e.segment) if e.segment in SEGMENT_ORDER else 99,
+            )
         )
+        sam_sources = sorted({
+            est.benchmark_source for est in r.economics.segment_sam_estimates if est.benchmark_source
+        })
+
+        verified_count = sum(1 for s in r.stakeholders if s.verified)
+        stakeholder_note = f" ({verified_count} verified ✓)" if verified_count else ""
 
         return f"""# Account research: {ov.legal_name}
 *Generated: {r.meta.refreshed_at.strftime("%Y-%m-%d %H:%M UTC")} | Confidence: {r.meta.confidence.overall} | Schema v{r.meta.schema_version}*
@@ -319,7 +353,7 @@ class AccountResearchPipeline:
 
 ---
 
-## Economics (FY{ec.fiscal_year or "N/A"})
+## Economics (FY{ec.fiscal_year or "N/A"}) — {ec.data_quality}
 | Metric | Value |
 |---|---|
 | Revenue | {_fmt_m(ec.revenue_usd_m)} |
@@ -329,7 +363,7 @@ class AccountResearchPipeline:
 | Capex | {_fmt_m(ec.capex_usd_m)} |
 | Data quality | {ec.data_quality} |
 
-### Revenue segments
+### Revenue segments (disclosed)
 {segments or "  Not available"}
 
 ### Semiconductor profile
@@ -339,6 +373,16 @@ class AccountResearchPipeline:
 - **Known chip suppliers:** {", ".join(semi.known_chip_suppliers) or "N/A"}
 - **Supply gaps:** {", ".join(semi.known_supply_gaps) or "N/A"}
 - **Qualification cycle:** {semi.qualification_cycle or "N/A"}
+
+### Segment SAM estimate (Power / EP / HPC / CONN / AMS)
+> ⚠️ **Benchmark-derived estimates, not disclosed figures.** These combine this
+> account's unit volume (where disclosed) with third-party semiconductor-content
+> benchmarks per vertical. Never treat as audited — check the confidence tag
+> on each line.
+
+{sam_lines or "  Not yet computed"}
+
+{("*Benchmark sources: " + "; ".join(sam_sources) + "*") if sam_sources else ""}
 
 ---
 

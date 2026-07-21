@@ -1,6 +1,16 @@
 """
-Pydantic models for the account research schema v1.1.0.
+Pydantic models for the account research schema v1.2.0.
 Each model maps 1:1 to the JSON schema defined in the design phase.
+
+v1.2.0 adds: Segment, BenchmarkConfidence, SegmentSAMEstimate, and the
+economics.segment_sam_estimates field — benchmark-derived Power / EP / HPC /
+CONN / AMS semiconductor SAM estimates for the target account. These are
+always distinct from audited financials: never set benchmark_confidence to
+anything implying "audited", and never omit the source/rationale fields.
+
+(v1.1.0 added the `verified` field on Stakeholder — People Data Labs
+integration. This file merges both lines of work; see the pipeline README's
+changelog for the full history.)
 """
 
 from __future__ import annotations
@@ -110,6 +120,27 @@ class SupplierStatus(str, Enum):
     STRATEGIC_PARTNER= "strategic_partner"
 
 
+class Segment(str, Enum):
+    """The five semiconductor product categories we sell into."""
+    POWER = "power"   # power management, discretes, SiC/GaN, motor drive
+    EP    = "ep"       # embedded processing: MCUs, embedded MPUs
+    HPC   = "hpc"       # high-performance compute: server/AI accelerator silicon
+    CONN  = "conn"     # connectivity: RF, networking, wireless/wired interfaces
+    AMS   = "ams"       # analog & mixed-signal: sensors, converters, signal chain
+
+
+class BenchmarkConfidence(str, Enum):
+    """
+    Quality tier of the underlying semiconductor-content benchmark used to
+    derive a segment SAM estimate. This is INDEPENDENT of DataQuality —
+    a segment SAM estimate is never "audited"; at best its benchmark is
+    "sourced" from a credible third-party study.
+    """
+    SOURCED        = "sourced"          # backed by a named, dated industry study
+    DIRECTIONAL    = "directional"      # reasonable estimate, not yet benchmark-sourced
+    NEEDS_RESEARCH = "needs_research"   # no usable benchmark yet for this vertical/segment
+
+
 # ---------------------------------------------------------------------------
 # Meta section
 # ---------------------------------------------------------------------------
@@ -130,7 +161,7 @@ class ConfidenceMap(BaseModel):
 
 
 class Meta(BaseModel):
-    schema_version:  str            = "1.1.0"
+    schema_version:  str            = "1.2.0"
     record_id:       str            = Field(default_factory=lambda: str(uuid.uuid4()))
     created_at:      datetime       = Field(default_factory=datetime.utcnow)
     refreshed_at:    datetime       = Field(default_factory=datetime.utcnow)
@@ -208,6 +239,13 @@ class Stakeholder(BaseModel):
     # ^ True only when this person was matched against a structured data
     # source (currently: People Data Labs), rather than purely LLM-inferred
     # from search snippets. Lets account managers weight contacts accordingly.
+    #
+    # Note: `verified` and the LLM-enrichment grounding pass (see
+    # extractors/grounding.py) are two DIFFERENT trust signals that can both
+    # apply to the same stakeholder. `verified=True` means matched against
+    # PDL; passing the grounding check only means the name appears somewhere
+    # in the source text/context given to the model. Treat `verified` as the
+    # stronger signal when both are present.
 
 
 # ---------------------------------------------------------------------------
@@ -248,10 +286,28 @@ class SemiconductorProfile(BaseModel):
     annual_chip_spend_est_usd_m:  Optional[float]         = None
 
 
+class SegmentSAMEstimate(BaseModel):
+    """
+    Benchmark-derived SAM estimate for ONE of the five segments, for THIS
+    account. Always additive to — never a replacement for — the audited
+    financials in Financials. When estimated_sam_low_usd_m/high are None,
+    it means we couldn't find a disclosed unit volume or a sourced
+    benchmark for this account/segment, not that the segment is zero.
+    """
+    segment:                    Segment
+    estimated_sam_low_usd_m:    Optional[float]      = None
+    estimated_sam_high_usd_m:   Optional[float]      = None
+    unit_basis:                 str                  = ""
+    benchmark_source:           str                  = ""
+    benchmark_confidence:       BenchmarkConfidence  = BenchmarkConfidence.NEEDS_RESEARCH
+    rationale:                  Optional[str]        = None
+
+
 class Economics(BaseModel):
-    financials:           Financials             = Field(default_factory=Financials)
-    revenue_segments:     list[RevenueSegment]   = Field(default_factory=list)
-    semiconductor_profile:SemiconductorProfile   = Field(default_factory=SemiconductorProfile)
+    financials:             Financials                  = Field(default_factory=Financials)
+    revenue_segments:       list[RevenueSegment]        = Field(default_factory=list)
+    semiconductor_profile:  SemiconductorProfile        = Field(default_factory=SemiconductorProfile)
+    segment_sam_estimates:  list[SegmentSAMEstimate]    = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
