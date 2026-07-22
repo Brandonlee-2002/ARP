@@ -17,10 +17,12 @@ Get a key at https://www.peopledatalabs.com
 from __future__ import annotations
 
 import logging
+import ssl
 from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
+import truststore
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +118,13 @@ class PeopleSearchExtractor:
 
     def __init__(self, api_key: str, timeout: int = 20):
         self.api_key = api_key
-        self._client = httpx.Client(timeout=timeout)
+        # See edgar.py for why verify=truststore's SSLContext is needed —
+        # same corporate-TLS-inspection issue applies to every extractor
+        # in this pipeline that uses httpx.
+        self._client = httpx.Client(
+            timeout=timeout,
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        )
 
     def search(
         self,

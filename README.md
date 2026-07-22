@@ -20,6 +20,87 @@ There's also a third, smaller artifact — `research_record_viewer.jsx` — whic
 
 ## Changelog
 
+### v1.3.0 — 2026-07-22
+
+**Added — `patent_search.py` wired into the pipeline as Stage 5 of 7**
+- New optional stage (requires `USPTO_API_KEY`; skipped cleanly if unset, same pattern as PDL/FCC). Runs after FCC facility lookup, before LLM enrichment.
+- **Stakeholder handling deliberately weaker than PDL, by design**: a patent inventor match on an existing stakeholder appends a corroborating note (patent count, segments, most recent grant date) — it never sets `verified=True` (reserved for PDL's current-employment signal) and, unlike PDL, an unmatched patent inventor is **never** added as a new stakeholder record. A patent proves someone invented something at some point, not that they still work there; presenting a possibly-years-stale inventor as an active contact would overclaim currency the data doesn't support. Their value surfaces instead through the signal below.
+- Patent inventors also anchor the stakeholder-extraction LLM prompt as candidates, with framing explicitly distinct from the PDL block: the model is told a patent inventor may only become a stakeholder if the source text *also* corroborates current employment — not from the patent list alone.
+- Grounding pass (`llm_enricher.py`) extended to treat a patent-inventor name as grounded even if it doesn't appear in web-search text, same reasoning as the earlier PDL grounding fix.
+- **New deterministic `account_intelligence` signal**: one `watch`-type `OpportunitySignal` per segment with patent activity (e.g. "14 granted patent(s) in Embedded Processing..."), built from `segment_patent_activity()`'s exact counts in plain Python — not summarized by the LLM, so there's no risk of the model restating a number we already have exactly right. Explicitly labeled as a raw count, not a trend (no year-over-year baseline is computed).
+- `meta.sources` gets a `"USPTO Open Data Portal (granted patents)"` entry when inventors are found (same "found, not merely ran" caveat as the PDL/FCC sources — still an open follow-up, not fixed here).
+
+**Verified before merging, not just read-through**
+- `_match_patent_inventor`'s name matching (exact + surname fallback, case-insensitive) tested in isolation against real inventor names from the Intel dataset, including a case-difference match, a surname-only fallback match, and confirming a `(name not found)` placeholder never matches.
+- The stakeholder note-formatting string tested against expected output.
+- `segment_patent_activity()`'s dedup-by-patent-number confirmed with a synthetic multi-co-inventor patent — a shared patent contributes to the segment count once, not once per co-inventor. This matters in practice: Intel's real patents frequently have 4–5 co-inventors each, so without this dedup the signal's counts would be substantially inflated.
+
+### v1.2.5 — 2026-07-22
+
+**Fixed — every extractor, not just patent_search.py**
+- All five HTTP-calling extractors (`edgar.py`, `web_search.py`, `people_search.py`, `fcc_search.py`, `patent_search.py`) failed with `[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain` on any network that does TLS inspection (corporate proxies like Zscaler, Palo Alto) — confirmed on a real corporate network, not theoretical. Root cause: `httpx` verifies against its own bundled `certifi` CA list by default, which has no knowledge of a corporate root CA that PowerShell/the OS already trusts. Every `httpx.Client(...)` construction (and the three direct `httpx.get`/`httpx.post` calls in `web_search.py`, which don't use a persistent client) now passes `verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)`, which validates against the OS certificate store instead — the same approach `pip` itself has used by default since v24.2. See [A note on corporate networks](#a-note-on-corporate-networks).
+- New dependency: `truststore >= 0.9.0`, added to `requirements.txt`. Not optional — every extractor now requires it at import time.
+
+**Verified**
+- `patent_search.py` re-run end-to-end against real USPTO data after this fix and the earlier pagination/CPC-whitespace/postal-vs-residence fixes: 426 distinct Intel Corporation inventors returned over a 5-year window, with segment tags (`conn`, `ep`, `hpc`, `ams`) correctly appearing on CPC-matched patents and non-US locations (France, Israel) correctly showing no state. This is the first real-scale validation of the extractor, not just the earlier 2-patent spot check.
+- **Gotcha found and resolved during this verification**: `pip_system_certs` (recommended earlier as a zero-code-change stopgap before this fix existed) and this code's own explicit `truststore.SSLContext(...)` usage conflict when both are installed — `pip_system_certs` does its own global `truststore`-based patching, and the two collide into `RecursionError: maximum recursion depth exceeded`. This is a known interaction (matches a currently-open `pip-system-certs` issue describing the identical symptom and fix). Resolution: `pip uninstall pip_system_certs` once this pipeline's own fix is in place — the global patch is redundant and actively harmful once the code handles it directly. Re-ran the exact same 426-inventor test afterward to confirm identical output with only `truststore` installed, confirming the fix doesn't depend on the stopgap package at all.
+
+### v1.2.4 — 2026-07-22
+
+**Fixed — `extractors/patent_search.py`, all confirmed against a real live response (Intel Corporation search)**
+- **Request body was rejected with 400 on every query, including the simplest possible one.** Root cause: `limit`/`offset` were sent as top-level JSON keys. USPTO's actual schema (confirmed against their published `ODP-API-Query-Spec.pdf`) requires them nested under `"pagination": {"offset": ..., "limit": ...}` — there is no partial credit here, a top-level `limit` key invalidates the whole request. `sort` also needed to be an array of `{"field", "order"}` objects, not the bare string previously sent.
+- **CPC segment tagging was silently broken for every patent.** Real CPC codes come back with inconsistent internal whitespace (`"G06F   9/30032"`, three spaces; `"H04N  21/438"`, two spaces), so `CPC_SEGMENT_MAP` prefix matching (e.g. `"G06F9"`) never matched anything. Fixed by normalizing (stripping all whitespace) on both sides before comparing — verified against the real response that a G06F-classified patent now correctly tags `ep`.
+- **`_parse_inventor_location` was written but never actually called** — `_aggregate_by_inventor` left every inventor's city/state/country as `None` with a comment admitting the gap. Now wired through end-to-end: `_parse_record` builds structured per-inventor dicts (name + location) instead of bare name strings, and the aggregator carries location through.
+- **Confirmed a real, not hypothetical, postal-vs-residence mismatch**: one inventor in the test data has a "postal" (correspondence) address in Chandler, AZ but a "residence" address in Gilbert, AZ. `_parse_inventor_location` now explicitly prefers `residence` — the stronger signal for where someone actually is — and this was verified to resolve correctly against that exact example, not just written to look plausible.
+- Root-caused a `403 Forbidden` that had nothing to do with the API key: USPTO's ODP sits behind AWS WAF, which blocks based on User-Agent *before* the API key is ever checked (confirmed via AWS's own docs on WAF evaluation order). PowerShell's and `httpx`'s default User-Agent strings both trigger this. `PatentSearchExtractor`'s client now always sends an ordinary browser User-Agent.
+
+**Verified, not just read-through**: the parser fixes above were run against the exact real API response obtained during debugging (reconstructed as test input), not just checked by eye — confirmed correct inventor/location/segment output before being called done.
+
+**Still not wired into `pipeline.py`** — the extractor itself is now confirmed working end-to-end; wiring it in as a stage (stakeholder-candidate feed + `account_intelligence` patent-activity signal, per the original design) is the next step whenever you're ready for it.
+
+### v1.2.3 — 2026-07-22
+
+**Fixed**
+- **USPTO ODP calls were silently blocked by AWS WAF based on User-Agent, regardless of API key validity.** USPTO's ODP sits behind AWS WAF, which evaluates its own rules (including User-Agent-based bot detection) *before* the API key/authorizer is ever checked. `httpx`'s default `User-Agent` header (`python-httpx/x.y.z`) reads as a script rather than a browser and got hard-blocked with a bare `{"message": "Forbidden"}` — indistinguishable from an invalid or unauthorized key. Confirmed via manual testing: the identical request succeeded once a normal browser User-Agent was set, and 403'd every time with any script-like default. `PatentSearchExtractor`'s `httpx.Client` now sets an ordinary browser User-Agent by default. This cost real debugging time chasing key/account-authorization theories before the actual cause (a firewall rule unrelated to authorization) was found — worth remembering for any future extractor added against USPTO or similarly WAF-fronted infrastructure.
+- Documented in `patent_search.py`'s module docstring, including the reminder not to strip the User-Agent header back out as a "cleanup."
+
+### v1.2.2 — 2026-07-21
+
+**Added**
+- **FCC facility lookup wired in as Stage 4** (of 6 total now) — always runs,
+  no API key required. Queries FCC's Socrata-hosted equipment authorization
+  grantee registrations (`extractors/fcc_search.py`) for the target company
+  and merges results into `locations`: a facility whose city matches an
+  existing (LLM-derived) location gets a corroborating note rather than a
+  duplicate entry; one with no match gets added as a new `Location` with
+  `type` defaulted to `design_center` and an explicit note that the type is
+  *inferred, not confirmed* — FCC data verifies a registered address for
+  RF-emitting products, not what the facility actually is.
+- `_score_confidence` now reaches `HIGH` on locations when even a single
+  FCC-corroborated address is present, not just on raw location count —
+  same reasoning EDGAR already gets for `economics` (an independent
+  government record outweighs having more LLM-inferred entries).
+- `meta.sources` gets an `"FCC Equipment Authorization (grantee
+  registrations)"` entry whenever facilities are found (see known gap below).
+- Optional `FCC_APP_TOKEN` env var — raises the Socrata rate limit; not
+  required for normal use.
+
+**Known gap carried over from this addition**
+- The FCC source-record addition only fires when facilities were actually
+  *found*, not merely whenever the stage *ran* — for the (common) case of a
+  company with no RF/wireless products, no source entry gets added, even
+  though the lookup did happen. This mirrors an identical, pre-existing
+  inconsistency in the PDL source-record logic. Fixing both properly means
+  threading an explicit "did this stage run" boolean through from
+  `pipeline.py` into `assembler.py` for both stages — left as a follow-up
+  rather than fixed asymmetrically for just one.
+
+**Not yet wired**
+- `extractors/patent_search.py` is now confirmed working against a real
+  USPTO key (see v1.2.3 above) but still not connected to `pipeline.py` —
+  field-name verification against a live response is the next step before
+  wiring it in as a stage.
+
 ### v1.2.1 — 2026-07-20
 
 This entry closes out work that earlier entries described but hadn't actually landed in code yet — see each bullet for what changed vs. what was already true.
@@ -128,28 +209,35 @@ Web search (14 queries)
         │
         ├──► LLM extraction ──► Grounding checks ──► Pydantic validation ──► AccountResearchRecord
         │    (6 sections +          (extractors/                                     │
-        │    segment SAM            grounding.py)
-        │    classification,             ▲
-        │    PDL-anchored)               │
-        │                                │
-SEC EDGAR ──────────────────────────────┤────────────────────►   JSON + Markdown summary
-(audited financials, public companies)  │                    ▲
-                                         │                    │
-People Data Labs ────────────────────────┴────────────────────┤
-(verified stakeholder contacts, optional — matched by name in │
- assembler.py; requires PDL_API_KEY)                          │
-                                                                │
-Segment benchmarks (segment_benchmarks.py) ────────────────────┘
+        │    segment SAM            grounding.py)                                    │
+        │    classification,             ▲                                           │
+        │    PDL- and patent-            │                                           │
+        │    anchored)                   │                                           │
+SEC EDGAR ──────────────────────────────┤──────────────────────────►   JSON + Markdown summary
+(audited financials)                    │                          ▲
+                                         │                          │
+People Data Labs ─────────────────────────┤ (verified contacts,     │
+(optional — PDL_API_KEY)                  │  matched by name)       │
+                                           │                         │
+FCC grantee registrations ─────────────────┤ (facility corroboration │
+(always runs, no key needed)               │  by city match)         │
+                                            │                         │
+USPTO Open Data Portal ──────────────────────┤ (inventor corroboration +
+(optional — USPTO_API_KEY)                   │  deterministic segment-
+                                              │  activity signal)
+Segment benchmarks (segment_benchmarks.py) ──┘
 (pure Python SAM math — no LLM involved)
 ```
 
-Five stages run in sequence, each independently fault-tolerant:
+Seven stages run in sequence, each independently fault-tolerant:
 
 1. **Web search** — fires 14 targeted queries across topics (overview, locations, stakeholders, financials, semiconductor profile, news) using Serper, Brave Search, or SerpAPI.
 2. **SEC EDGAR** — for US-listed companies, fetches audited 10-K / 20-F financials directly from EDGAR's public XBRL API. No API key required.
 3. **People search** *(optional)* — if `PDL_API_KEY` is set, looks up verified decision-maker contacts (name, title, LinkedIn, email) via People Data Labs. Skipped entirely if the key isn't set.
-4. **LLM enrichment** — Claude makes one focused call per schema section, returning JSON. EDGAR numbers override LLM estimates where both exist; verified PDL contacts are listed in the stakeholder prompt so Claude prefers their real names/titles over inference. A dedicated call also classifies the account's semiconductor end-market vertical and looks for a disclosed unit volume — but never invents one; the actual segment SAM dollar math happens afterward in plain Python (`segment_benchmarks.py`), never inside the LLM call. A grounding pass (`extractors/grounding.py`) then re-checks stakeholder names (against both the search snippets *and* the PDL contact list — a name that's only in the PDL list is still grounded), the disclosed unit volume, and news URLs, discarding or flagging anything that doesn't trace back to something real.
-5. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output. LLM-extracted stakeholders are matched against PDL contacts by normalized name (exact, then surname fallback); a match sets `verified: true` and lets the structured PDL contact info override anything the LLM inferred. Any verified contact the LLM never surfaced is still added via a safety net rather than dropped.
+4. **FCC facility lookup** *(always runs, no key required)* — queries FCC equipment authorization grantee registrations for the target company and merges results into `locations`: a city match with an existing (LLM-derived) location gets a corroborating note; no match gets added as a new, explicitly-caveated `Location` entry. Only surfaces anything for companies with RF/wireless products.
+5. **Patent search** *(optional)* — if `USPTO_API_KEY` is set, looks up granted patents and their named inventors, tagged by CPC classification into the five segments. Treated more conservatively than PDL: a matched inventor only ever corroborates an existing stakeholder with a note (patent count, segments, most recent grant) — it never sets `verified: true` and never adds a new stakeholder record for an unmatched inventor, since a patent proves inventorship at some point in time, not current employment. Segment-level patent-activity counts also feed a deterministic `account_intelligence` signal, computed in plain Python from exact counts rather than summarized by the LLM.
+6. **LLM enrichment** — Claude makes one focused call per schema section, returning JSON. EDGAR numbers override LLM estimates where both exist; verified PDL contacts and known patent inventors are both listed in the stakeholder prompt (with different framing — PDL contacts are presented as confirmed current employees, patent inventors are explicitly flagged as needing corroboration) so Claude prefers real names/titles over inference. A dedicated call also classifies the account's semiconductor end-market vertical and looks for a disclosed unit volume — but never invents one; the actual segment SAM dollar math happens afterward in plain Python (`segment_benchmarks.py`), never inside the LLM call. A grounding pass (`extractors/grounding.py`) then re-checks stakeholder names (against the search snippets, the PDL contact list, *and* the patent inventor list — a name only present in one of those lists is still grounded), the disclosed unit volume, and news URLs, discarding or flagging anything that doesn't trace back to something real.
+7. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output. LLM-extracted stakeholders are matched against PDL contacts by normalized name (exact, then surname fallback); a match sets `verified: true` and lets the structured PDL contact info override anything the LLM inferred. Any verified PDL contact the LLM never surfaced is still added via a safety net rather than dropped — patent inventors deliberately do **not** get this same safety-net treatment (see Stage 5).
 
 ---
 
@@ -192,11 +280,15 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export SEARCH_API_KEY="your-key-here"
 export SEARCH_PROVIDER="serper"        # serper | brave | serpapi
 export PDL_API_KEY="your-pdl-key"      # optional — enables verified stakeholder contacts
+export FCC_APP_TOKEN="your-token"      # optional — raises the FCC Socrata rate limit; not required
+export USPTO_API_KEY="your-uspto-key"  # optional — enables patent inventor lookup + segment activity signals
 ```
 
 Serper (`serper.dev`) is recommended — roughly $0.001 per query, so a full pipeline run costs under $0.02 in search fees.
 
 `PDL_API_KEY` is optional. [People Data Labs](https://www.peopledatalabs.com) offers a free tier (1,000 records/month, no credit card) that's normally enough for regular use. Without it, the pipeline behaves exactly as in v1.0.0 — stakeholders are inferred entirely from web search snippets (and grounding-checked, as of v1.2.0).
+
+`USPTO_API_KEY` is also optional and free, but requires more setup than the others: a USPTO.gov account verified through ID.me (see `extractors/patent_search.py`'s module docstring, or the pipeline's earlier troubleshooting notes, for the full registration flow). Without it, patent-inventor lookup and the segment patent-activity signal are simply skipped — everything else behaves the same.
 
 ### 3. Run
 
@@ -297,6 +389,8 @@ account_research/
 │   ├── web_search.py            # Multi-query web search (Serper / Brave / SerpAPI)
 │   ├── edgar.py                  # SEC EDGAR XBRL financials (free, no key)
 │   ├── people_search.py         # People Data Labs verified contacts (optional, free tier)
+│   ├── fcc_search.py             # FCC equipment authorization facility lookup (free, no key)
+│   ├── patent_search.py         # USPTO granted-patent inventor + segment activity lookup (optional, free)
 │   ├── llm_enricher.py          # Section-by-section Claude extraction
 │   ├── segment_benchmarks.py    # Power/EP/HPC/CONN/AMS content benchmarks + SAM math
 │   └── grounding.py              # Post-extraction checks that a claim traces to source text
@@ -344,13 +438,13 @@ Pydantic validation (in `assembler.py`) checks that LLM output has the right **s
 
 | Field | Check | What happens if ungrounded |
 |---|---|---|
-| Stakeholder `name` | Must appear (or closely match) in the stakeholder source snippets **or** the verified PDL contact list | Replaced with a role-title placeholder, e.g. `"VP of Procurement (name not found)"` |
+| Stakeholder `name` | Must appear (or closely match) in the stakeholder source snippets **or** the verified PDL contact list **or** the known patent inventor list | Replaced with a role-title placeholder, e.g. `"VP of Procurement (name not found)"` |
 | `annual_unit_volume` (segment SAM classification) | The digit sequence must appear in the source text | Discarded (set to `null`); the record gets a `needs_research` segment SAM estimate instead of a fabricated one |
 | News item `url` | Must match a URL actually returned by that account's "news"-topic search queries | The entire news item is dropped |
 
-This is deliberately **not** a semantic entailment check — it won't catch a model subtly misreading a real sentence. It only catches outright invention: a name, number, or citation that doesn't trace back to anything actually retrieved (or, for stakeholder names, actually supplied as a verified contact). Every relevant prompt in `llm_enricher.py` also carries an explicit "do not fabricate — use null or a placeholder instead" instruction, but that instruction is a first line of defense, not a guarantee — the grounding pass runs regardless of whether the model says it complied.
+This is deliberately **not** a semantic entailment check — it won't catch a model subtly misreading a real sentence. It only catches outright invention: a name, number, or citation that doesn't trace back to anything actually retrieved (or, for stakeholder names, actually supplied as a verified contact or known patent inventor). Every relevant prompt in `llm_enricher.py` also carries an explicit "do not fabricate — use null or a placeholder instead" instruction, but that instruction is a first line of defense, not a guarantee — the grounding pass runs regardless of whether the model says it complied.
 
-**Relationship to the `verified` (PDL) flag:** `verified` and grounding are two *different* trust signals, reconciled as of v1.2.1. `verified: true` means the name was matched against a structured third-party source (People Data Labs) in `assembler.py`; passing the grounding check in `llm_enricher.py` means the name appears somewhere in the web-search snippets *or* the PDL contact list handed to the model. A name can be grounded without being PDL-verified (e.g. found correctly in a press release, but PDL didn't return that person), or verified without needing the grounding check to have mattered (the assembler's name-match is independent of and runs after the LLM step). Treat `verified` as the stronger signal — it comes from a structured lookup, not text extraction — but a `medium`-confidence, unverified-but-grounded stakeholder is still meaningfully more trustworthy than one the grounding pass had to replace with a placeholder.
+**Relationship to the `verified` (PDL) flag, and where patent inventors sit relative to both:** these are three *different* trust signals that don't all carry the same weight. `verified: true` means the name was matched against a structured, current-employment-oriented source (People Data Labs) in `assembler.py` — the strongest signal, since it targets *currently works here*. Passing the grounding check in `llm_enricher.py` means the name appears somewhere in the web-search snippets, the PDL contact list, *or* the patent inventor list handed to the model — a much weaker claim: it means the name wasn't invented, not that the person is currently employed there. A patent-matched stakeholder gets a corroborating note (patent count, segments, grant date) but **never** `verified: true` — a patent proves inventorship at some point in time, which is a meaningfully different (and weaker) claim than PDL's current-employment signal, and conflating the two would overstate how current a patent-sourced name is. Treat the three in this order of strength: `verified` (PDL) > grounded-via-web-text > grounded-via-patent-only.
 
 None of this eliminates hallucination risk entirely. Narrative fields (the `summary`, `opportunity_signals` descriptions, `qualification_cycle` text) aren't grounding-checked, since there's no simple literal test for whether a paraphrase is faithful to its source. Treat every field in a `medium` or `low` confidence record — and every `needs_research`/`directional` segment SAM estimate — as something to verify before it goes into a customer-facing deliverable.
 
@@ -453,12 +547,31 @@ with ThreadPoolExecutor(max_workers=3) as pool:
 
 ---
 
+## A note on corporate networks
+
+If you're running this from inside a company network with TLS inspection (Zscaler, Palo Alto, Netskope, and similar corporate proxies all do this), you may hit this on first run:
+
+```
+[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain
+```
+
+This isn't a bug in the pipeline's requests — it's a mismatch between two different certificate stores. Your OS (and anything that uses it, like PowerShell's `Invoke-RestMethod`) already trusts your company's internal root certificate, because IT pushed it out. Python's `httpx` doesn't use the OS store by default — it ships its own separate, bundled CA list (`certifi`) that has never heard of your company's certificate, so it correctly refuses to trust what looks like a self-signed certificate sitting in the middle of the connection.
+
+As of v1.2.5, every extractor in this pipeline passes `verify=truststore.SSLContext(...)` to its `httpx` calls, which checks against the OS certificate store instead — the same fix `pip` itself adopted by default starting in v24.2. This should resolve the error with no further configuration, since your OS almost certainly already trusts the corporate root your IT team installed.
+
+If you hit this error on a *different* library this pipeline doesn't control (e.g. while debugging with `curl.exe`, or in some other tool entirely), the fastest one-command fix for local testing is `pip install pip_system_certs`, which patches Python globally to use the OS store for anything using standard SSL contexts — not required for this pipeline itself once on v1.2.5, but useful to know about for adjacent tooling.
+
+**Do not install `pip_system_certs` alongside running this pipeline.** If you used it as a stopgap before v1.2.5 existed, uninstall it now (`pip uninstall pip_system_certs`) — running it together with this code's own `truststore.SSLContext(...)` usage causes `RecursionError: maximum recursion depth exceeded`, since both patch SSL context creation in ways that collide. `truststore` alone (already in `requirements.txt`) is all this pipeline needs.
+
+---
+
 ## Requirements
 
 - Python 3.11+
 - `anthropic >= 0.25.0`
 - `httpx >= 0.27.0`
 - `pydantic >= 2.0.0`
+- `truststore >= 0.9.0` — required, not optional; see [A note on corporate networks](#a-note-on-corporate-networks) below
 - A search API key (Serper, Brave, or SerpAPI)
 - An Anthropic API key
 - `PDL_API_KEY` (optional) — for verified stakeholder contacts via People Data Labs

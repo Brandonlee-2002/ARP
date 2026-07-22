@@ -13,6 +13,14 @@ Environment variables:
     PDL_API_KEY         — optional (enables verified stakeholder contacts
                            via People Data Labs; pipeline behaves exactly
                            as without it when unset)
+    FCC_APP_TOKEN       — optional (raises the FCC Socrata rate limit;
+                           the FCC facility-lookup stage runs with or
+                           without this — it needs no key at all)
+    USPTO_API_KEY       — optional (enables patent-inventor lookup via
+                           USPTO's Open Data Portal; pipeline behaves
+                           exactly as without it when unset). Requires a
+                           USPTO.gov account verified through ID.me — see
+                           extractors/patent_search.py's module docstring.
 """
 
 from __future__ import annotations
@@ -27,7 +35,9 @@ from typing import Optional
 import anthropic
 
 from ..extractors.edgar import EdgarExtractor
+from ..extractors.fcc_search import FccSearchExtractor
 from ..extractors.llm_enricher import LLMEnricher
+from ..extractors.patent_search import PatentSearchExtractor, segment_patent_activity
 from ..extractors.people_search import PeopleSearchExtractor
 from ..extractors.web_search import WebSearchExtractor
 from ..models.schema import AccountResearchRecord
@@ -54,11 +64,26 @@ class AccountResearchPipeline:
         3. People search (optional) — verified decision-maker contacts via
                           People Data Labs; skipped entirely if PDL_API_KEY
                           isn't set
-        4. LLM enrich  — section-by-section structured extraction
+        4. FCC facility lookup — corroborates/adds design-center-relevant
+                          locations from FCC equipment authorization
+                          grantee registrations; always runs, no key
+                          required (only surfaces anything for companies
+                          with RF/wireless products — see fcc_search.py)
+        5. Patent search (optional) — inventor names + segment-classified
+                          patent activity via USPTO's Open Data Portal;
+                          skipped entirely if USPTO_API_KEY isn't set.
+                          Deliberately NOT treated like PDL: a patent
+                          inventor match only ever corroborates an
+                          existing stakeholder with a note — it never adds
+                          a new stakeholder record the way an unmatched
+                          verified PDL contact does, since a patent proves
+                          someone invented something at some point, not
+                          that they still work there.
+        6. LLM enrich  — section-by-section structured extraction
                           (includes benchmark-derived segment SAM estimates;
                           verified contacts anchor the stakeholder prompt)
-        5. Assemble    — validate, merge, score confidence
-        6. Save        — write JSON + summary to disk
+        7. Assemble    — validate, merge, score confidence
+        8. Save        — write JSON + summary to disk
 
     All stages are independently fault-tolerant.
     """
@@ -69,6 +94,8 @@ class AccountResearchPipeline:
         search_api_key:   str,
         search_provider:  str = "serper",
         people_search_api_key: Optional[str] = None,
+        fcc_app_token: Optional[str] = None,
+        uspto_api_key: Optional[str] = None,
     ):
         self._llm       = LLMEnricher(client=anthropic_client)
         self._web       = WebSearchExtractor(
@@ -79,6 +106,13 @@ class AccountResearchPipeline:
         self._people    = (
             PeopleSearchExtractor(api_key=people_search_api_key)
             if people_search_api_key else None
+        )
+        # FCC needs no key at all — always constructed. fcc_app_token is
+        # an optional Socrata rate-limit raiser, not an enable/disable switch.
+        self._fcc       = FccSearchExtractor(app_token=fcc_app_token)
+        self._patents   = (
+            PatentSearchExtractor(api_key=uspto_api_key)
+            if uspto_api_key else None
         )
         self._assembler = RecordAssembler()
 
@@ -92,7 +126,9 @@ class AccountResearchPipeline:
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         search_key    = os.environ.get("SEARCH_API_KEY")
         provider      = os.environ.get("SEARCH_PROVIDER", "serper")
-        pdl_key       = os.environ.get("PDL_API_KEY")  # optional
+        pdl_key       = os.environ.get("PDL_API_KEY")      # optional
+        fcc_token     = os.environ.get("FCC_APP_TOKEN")    # optional
+        uspto_key     = os.environ.get("USPTO_API_KEY")    # optional
 
         if not anthropic_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable not set")
@@ -104,6 +140,8 @@ class AccountResearchPipeline:
             search_api_key=search_key,
             search_provider=provider,
             people_search_api_key=pdl_key,
+            fcc_app_token=fcc_token,
+            uspto_api_key=uspto_key,
         )
 
     # ------------------------------------------------------------------
@@ -136,7 +174,7 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         # Stage 1: Web search
         # ------------------------------------------------------------------
-        logger.info("[Stage 1/5] Web search...")
+        logger.info("[Stage 1/7] Web search...")
         search_results = self._web.fetch_all(company_name, domain)
         logger.info("  → %d search snippets collected", len(search_results))
 
@@ -147,7 +185,7 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         edgar_data = None
         if ticker:
-            logger.info("[Stage 2/5] EDGAR lookup for ticker %s...", ticker)
+            logger.info("[Stage 2/7] EDGAR lookup for ticker %s...", ticker)
             edgar_data = self._edgar.fetch(ticker)
             if edgar_data:
                 logger.info(
@@ -158,35 +196,58 @@ class AccountResearchPipeline:
             else:
                 logger.info("  → No EDGAR data found (private company or foreign issuer)")
         else:
-            logger.info("[Stage 2/5] Skipping EDGAR (no ticker provided)")
+            logger.info("[Stage 2/7] Skipping EDGAR (no ticker provided)")
 
         # ------------------------------------------------------------------
         # Stage 3: People search (optional — requires PDL_API_KEY)
         # ------------------------------------------------------------------
         pdl_contacts = []
         if self._people:
-            logger.info("[Stage 3/5] People search (People Data Labs)...")
+            logger.info("[Stage 3/7] People search (People Data Labs)...")
             pdl_contacts = self._people.search(company_name, domain)
             logger.info("  → %d verified contacts found", len(pdl_contacts))
         else:
-            logger.info("[Stage 3/5] Skipping people search (PDL_API_KEY not set)")
+            logger.info("[Stage 3/7] Skipping people search (PDL_API_KEY not set)")
 
         # ------------------------------------------------------------------
-        # Stage 4: LLM enrichment
+        # Stage 4: FCC facility lookup (always runs — no key required)
         # ------------------------------------------------------------------
-        logger.info("[Stage 4/5] LLM enrichment (6 sections + segment SAM)...")
+        logger.info("[Stage 4/7] FCC facility lookup...")
+        fcc_facilities = self._fcc.search(company_name)
+        if fcc_facilities:
+            logger.info("  → %d FCC-registered facility record(s) found", len(fcc_facilities))
+        else:
+            logger.info("  → No FCC equipment authorization records found "
+                        "(expected for companies with no RF/wireless products)")
+
+        # ------------------------------------------------------------------
+        # Stage 5: Patent search (optional — requires USPTO_API_KEY)
+        # ------------------------------------------------------------------
+        patent_inventors = []
+        if self._patents:
+            logger.info("[Stage 5/7] Patent search (USPTO Open Data Portal)...")
+            patent_inventors = self._patents.search(company_name)
+            logger.info("  → %d distinct patent inventor(s) found", len(patent_inventors))
+        else:
+            logger.info("[Stage 5/7] Skipping patent search (USPTO_API_KEY not set)")
+
+        # ------------------------------------------------------------------
+        # Stage 6: LLM enrichment
+        # ------------------------------------------------------------------
+        logger.info("[Stage 6/7] LLM enrichment (6 sections + segment SAM)...")
         enriched = self._llm.enrich(
             company_name=company_name,
             domain=domain,
             search_results=search_results,
             edgar_data=edgar_data,
             pdl_contacts=pdl_contacts,
+            patent_inventors=patent_inventors,
         )
 
         # ------------------------------------------------------------------
-        # Stage 5: Assemble and validate
+        # Stage 7: Assemble and validate
         # ------------------------------------------------------------------
-        logger.info("[Stage 5/5] Assembling and validating record...")
+        logger.info("[Stage 7/7] Assembling and validating record...")
         record = self._assembler.assemble(
             company_name=company_name,
             domain=domain,
@@ -195,6 +256,8 @@ class AccountResearchPipeline:
             search_sources=search_sources,
             refresh_cadence=refresh_cadence,
             pdl_contacts=pdl_contacts,
+            fcc_facilities=fcc_facilities,
+            patent_inventors=patent_inventors,
         )
 
         logger.info("Pipeline complete.")
@@ -288,6 +351,7 @@ class AccountResearchPipeline:
             f"  - [{loc.type.upper()}] {loc.city}, {loc.country}"
             + (f" — {loc.name}" if loc.name else "")
             + (f" ({loc.status})" if loc.status != "active" else "")
+            + (" 📡 FCC-registered" if loc.notes and "FCC equipment authorization" in loc.notes else "")
             for loc in r.locations[:8]
         )
 

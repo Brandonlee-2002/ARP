@@ -7,16 +7,21 @@ we need to populate the Economics section.
 
 No API key required — EDGAR has a free public REST API.
 Rate limit: 10 requests/second per EDGAR's fair-use policy.
+
+Uses truststore (not the bundled certifi CA list) for TLS verification —
+see the note above self._client below for why.
 """
 
 from __future__ import annotations
 
 import logging
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
+import truststore
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +63,19 @@ class EdgarExtractor:
 
     def __init__(self, timeout: int = 20):
         self.timeout = timeout
-        self._client = httpx.Client(headers=HEADERS, timeout=timeout)
+        # verify=truststore's SSLContext uses the OS certificate store
+        # (Windows CryptoAPI, macOS Keychain, etc.) instead of httpx's
+        # bundled certifi list. Without this, any machine behind corporate
+        # TLS inspection (Zscaler, Palo Alto, etc.) gets a
+        # CERTIFICATE_VERIFY_FAILED / "self-signed certificate in
+        # certificate chain" error — confirmed on a real corporate network,
+        # not theoretical. httpx's own docs document this exact pattern:
+        # https://www.python-httpx.org/advanced/ssl/
+        self._client = httpx.Client(
+            headers=HEADERS,
+            timeout=timeout,
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        )
 
     def fetch(self, ticker: str) -> Optional[EdgarFinancials]:
         """

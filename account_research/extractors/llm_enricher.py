@@ -41,6 +41,7 @@ import anthropic
 from ..extractors.web_search import SearchResult
 from ..extractors.edgar import EdgarFinancials
 from ..extractors.people_search import PersonProfile
+from ..extractors.patent_search import PatentInventor
 from ..extractors.segment_benchmarks import BENCHMARKS, guess_vertical, estimate_segment_sam
 from ..extractors.grounding import text_contains_claim, number_grounded, is_url_grounded
 
@@ -123,6 +124,7 @@ class LLMEnricher:
         search_results: list[SearchResult],
         edgar_data: Optional[EdgarFinancials] = None,
         pdl_contacts: Optional[list[PersonProfile]] = None,
+        patent_inventors: Optional[list[PatentInventor]] = None,
     ) -> dict[str, Any]:
         """
         Returns a dict with keys matching AccountResearchRecord sections.
@@ -135,6 +137,14 @@ class LLMEnricher:
         snippets. Assembler.py does the actual name-matching + verified
         flag + safety-net merge; this method only makes the LLM aware of
         them as candidates.
+
+        patent_inventors: PatentInventor objects from extractors/
+        patent_search.py (optional). Also anchor the stakeholder prompt as
+        candidates, but with a DIFFERENT caveat than PDL — a patent proves
+        someone invented something at some point, not that they still
+        work there. The prompt below reflects that distinction, and
+        assembler.py never adds an unmatched patent inventor as a new
+        stakeholder record the way it does for unmatched PDL contacts.
         """
         # Group search snippets by topic for targeted prompts
         by_topic = self._group_by_topic(search_results)
@@ -145,7 +155,9 @@ class LLMEnricher:
 
         sections["overview"]      = self._extract_overview(company_name, domain, by_topic)
         sections["locations"]     = self._extract_locations(company_name, by_topic)
-        sections["stakeholders"]  = self._extract_stakeholders(company_name, by_topic, pdl_contacts)
+        sections["stakeholders"]  = self._extract_stakeholders(
+            company_name, by_topic, pdl_contacts, patent_inventors
+        )
         sections["economics"]     = self._extract_economics(company_name, by_topic, edgar_data)
 
         # Segment SAM depends on overview (business description) and
@@ -227,9 +239,11 @@ Put HQ first. Include at most 12 locations.
         company_name: str,
         by_topic: dict[str, str],
         pdl_contacts: Optional[list[PersonProfile]] = None,
+        patent_inventors: Optional[list[PatentInventor]] = None,
     ) -> list:
         source_text = by_topic.get("stakeholders", "")
         pdl_contacts = pdl_contacts or []
+        patent_inventors = patent_inventors or []
 
         pdl_block = ""
         pdl_names_text = ""
@@ -252,10 +266,38 @@ name and title over inferring a different person for the same role):
 {chr(10).join(lines)}
 """
 
+        # Patent inventors get a DIFFERENT framing than PDL contacts — a
+        # patent proves someone invented something at some point, not that
+        # they still work here. The model is told not to assume current
+        # employment or a specific title from this list alone.
+        patent_block = ""
+        patent_names_text = ""
+        if patent_inventors:
+            lines = []
+            for inv in patent_inventors[:15]:  # cap — some companies have hundreds
+                if not inv.name:
+                    continue
+                segs = ", ".join(sorted(inv.segments)) if inv.segments else None
+                bits = [inv.name, f"— {inv.patent_count} granted patent(s)"]
+                if segs:
+                    bits.append(f"(segments: {segs})")
+                if inv.most_recent_grant:
+                    bits.append(f"most recent grant: {inv.most_recent_grant}")
+                lines.append(" ".join(bits))
+            patent_names_text = "\n".join(f"[{inv.name}]" for inv in patent_inventors if inv.name)
+            patent_block = f"""
+KNOWN PATENT INVENTORS (real people who have been granted patents assigned to
+this company — NOT confirmed current employees; a patent can be years old.
+Only use one of these as a stakeholder if the source text ALSO corroborates
+they currently work here — otherwise leave them out rather than assuming an
+active role from patent data alone):
+{chr(10).join(lines)}
+"""
+
         prompt = f"""
 Extract key stakeholders and decision-makers for "{company_name}" who would be
 relevant to a semiconductor supplier's account manager.
-{pdl_block}
+{pdl_block}{patent_block}
 SOURCE TEXT:
 {source_text or "(no stakeholder snippets found)"}
 
@@ -285,23 +327,25 @@ Include 4-8 people. Set influence_score based on role (economic_buyer 0.8-1.0,
 technical_buyer 0.6-0.8, executive_sponsor 0.5-0.7, others 0.3-0.6).
 
 IMPORTANT — do not fabricate names. If a KNOWN VERIFIED CONTACT above fits a
-relevant role, use their exact name and title. For any other role, only use a
-real person's name if it literally appears in the source text. If you cannot
-find a real name for a role you believe exists, use the role title itself as
-the "name" field instead — e.g. "VP of Procurement (name not found)" — rather
-than inventing a plausible-sounding person. A made-up name is worse than an
-honest placeholder.
+relevant role, use their exact name and title. A KNOWN PATENT INVENTOR may
+only be used if the source text corroborates current employment — do not
+promote a patent inventor to a stakeholder based on the patent list alone.
+For any other role, only use a real person's name if it literally appears in
+the source text. If you cannot find a real name for a role you believe
+exists, use the role title itself as the "name" field instead — e.g. "VP of
+Procurement (name not found)" — rather than inventing a plausible-sounding
+person. A made-up name is worse than an honest placeholder.
 """
         result = self._call(prompt, section="stakeholders", expect_list=True)
         result = result if isinstance(result, list) else []
 
         # Grounding pass: re-check every name against source text OR the
-        # verified PDL contact list. A name that only appears in the PDL
-        # block (not in the raw web snippets) is still genuinely grounded —
+        # verified PDL/patent lists. A name that only appears in one of
+        # those (not in the raw web snippets) is still genuinely grounded —
         # it's sourced from a structured data provider, just not from text
-        # the model was quoting. Without including pdl_names_text here, a
-        # correctly PDL-anchored name would be wrongly treated as invented.
-        grounding_source = f"{source_text}\n{pdl_names_text}"
+        # the model was quoting. Without including these here, a correctly
+        # anchored name would be wrongly treated as invented.
+        grounding_source = f"{source_text}\n{pdl_names_text}\n{patent_names_text}"
         for item in result:
             name  = item.get("name", "") or ""
             title = item.get("title", "") or "Unknown role"
