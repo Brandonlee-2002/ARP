@@ -20,6 +20,21 @@ There's also a third, smaller artifact — `research_record_viewer.jsx` — whic
 
 ## Changelog
 
+### v1.3.1 — 2026-07-23
+
+**Added — SEC SIC classification as an audited anchor for segment SAM vertical matching**
+- `edgar.py`'s `fetch()` now also pulls the filer's SIC code + description from EDGAR's `submissions` endpoint (e.g. Apple → `sic="3571"`, `sicDescription="Electronic Computers"`) — a structured, audited fact from the same free CIK-based lookup already in use, not a new API surface. Best-effort: a failure here never blocks the financials fetch.
+- New `SIC_VERTICAL_HINTS` table in `segment_benchmarks.py` maps relevant SIC codes to the vertical(s) they typically imply. Deliberately a candidate LIST, not a 1:1 mapping — SIC 3711 ("Motor Vehicles & Passenger Car Bodies") covers EV and ICE automakers alike, and SIC 3571 covers both AI-server and general-purpose-server makers, so SIC classification alone can't make either distinction.
+- `llm_enricher.py`'s segment SAM classification prompt now includes the SIC code/description as an anchor fact when available — narrows the model's candidates without dictating the answer. The model is explicitly told not to force a match onto a SIC-suggested candidate if the actual source text doesn't support it.
+- Fallback priority when the LLM itself returns `vertical_key: null`: an **unambiguous** SIC hint (exactly one candidate) is used directly; an **ambiguous** SIC hint (2+ candidates, e.g. the auto or datacenter cases) is deliberately NOT auto-picked — picking either half of an ambiguous pair is just as likely to be wrong as guessing blind, so it falls through to the existing keyword-based `guess_vertical()` fallback instead.
+- No schema changes, no new pipeline stage, no assembler changes — this rides entirely on data `edgar.py` already fetches and a field (`edgar_data`) `llm_enricher.py` already receives.
+- **Python-pipeline-only.** `app.jsx` still cannot reach `data.sec.gov` at all (same CORS + `User-Agent` wall as EDGAR financials always have been) — its segment SAM classification remains web-search-only, with no SIC anchor available.
+
+**Verified before merging**
+- `sic_vertical_hint()` tested directly: correct candidate lists for mapped codes, `None` for unmapped/missing codes, defensive against a leading-zero formatting variant.
+- The ambiguous-vs-unambiguous fallback distinction tested directly — confirmed an ambiguous SIC hint (auto) correctly falls through to the keyword guess rather than being auto-picked, while an unambiguous hint (telecom) is used directly.
+- Full package re-verified to still import and instantiate correctly after these changes; `EdgarFinancials`'s two new fields confirmed to default to `None` (fully backward compatible with any code not yet aware of them).
+
 ### v1.3.0 — 2026-07-22
 
 **Added — `patent_search.py` wired into the pipeline as Stage 5 of 7**
@@ -494,10 +509,11 @@ For **target accounts you sell chips to** (as opposed to semiconductor suppliers
 
 How it's computed (see `extractors/segment_benchmarks.py`):
 
-1. The LLM identifies which benchmarked vertical (`auto_ice`, `auto_ev`, `datacenter_ai_server`, etc. — see `BENCHMARKS` in that file) fits the account, and looks for a disclosed annual unit volume. It's explicitly instructed to return `null` rather than invent a number — `annual_unit_volume` is `null` far more often than not.
-2. A grounding check (see [Grounding safeguards](#grounding-safeguards)) re-verifies that any returned unit volume actually appears in the source text before it's trusted.
-3. If both a vertical and a grounded unit volume are found, `estimate_segment_sam()` — pure Python, no LLM — multiplies unit volume × the vertical's $/unit benchmark range × each segment's allocation percentage.
-4. Every record always gets exactly 5 entries (`power`, `ep`, `hpc`, `conn`, `ams`), even when a number couldn't be computed — in that case `estimated_sam_low_usd_m`/`high` are `null` and `benchmark_confidence` reads `needs_research`, so downstream viewers (including `research_record_viewer.jsx`) can render an explicit "no estimate yet" state per segment instead of silently omitting it.
+1. When the target has a ticker, EDGAR's filer SIC classification (audited, structured — see `edgar.py`) is fed to the LLM as an anchor fact via `sic_vertical_hint()`, narrowing likely candidates without dictating the answer. SIC codes are coarser than this taxonomy — one code covers both EV and ICE automakers, for instance — so this informs the classification, it doesn't replace it.
+2. The LLM identifies which benchmarked vertical (`auto_ice`, `auto_ev`, `datacenter_ai_server`, etc. — see `BENCHMARKS` in that file) fits the account, and looks for a disclosed annual unit volume. It's explicitly instructed to return `null` rather than invent a number — `annual_unit_volume` is `null` far more often than not.
+3. A grounding check (see [Grounding safeguards](#grounding-safeguards)) re-verifies that any returned unit volume actually appears in the source text before it's trusted. If the LLM itself returns `vertical_key: null`, an *unambiguous* SIC hint (exactly one candidate) is used as a fallback; an *ambiguous* one (2+ candidates) is not auto-picked — it falls through to the keyword-based `guess_vertical()` fallback instead, since guessing between two SIC-suggested candidates isn't meaningfully better than guessing blind.
+4. If both a vertical and a grounded unit volume are found, `estimate_segment_sam()` — pure Python, no LLM — multiplies unit volume × the vertical's $/unit benchmark range × each segment's allocation percentage.
+5. Every record always gets exactly 5 entries (`power`, `ep`, `hpc`, `conn`, `ams`), even when a number couldn't be computed — in that case `estimated_sam_low_usd_m`/`high` are `null` and `benchmark_confidence` reads `needs_research`, so downstream viewers (including `research_record_viewer.jsx`) can render an explicit "no estimate yet" state per segment instead of silently omitting it.
 
 **Benchmark coverage as of this schema version:**
 

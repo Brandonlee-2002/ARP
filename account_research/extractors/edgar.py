@@ -50,6 +50,17 @@ class EdgarFinancials:
     capex_usd:            Optional[float] = None
     total_assets_usd:     Optional[float] = None
     data_quality:         str             = "audited"
+    # SEC's own structured filer classification — NOT a financial figure,
+    # but bundled here since it comes from the same free CIK-based lookup
+    # path and there's no other natural home for it. Used to give the
+    # segment SAM vertical classification an audited anchor fact instead
+    # of relying purely on web search + LLM judgment. See
+    # segment_benchmarks.py's SIC_VERTICAL_HINTS for how this gets used —
+    # SIC codes are coarser than our vertical taxonomy (e.g. one code
+    # covers both EV and ICE automakers), so this informs the LLM's
+    # classification call, it doesn't override it.
+    sic:                  Optional[str]   = None
+    sic_description:      Optional[str]   = None
 
 
 class EdgarExtractor:
@@ -94,6 +105,18 @@ class EdgarExtractor:
                 return None
 
             result = self._extract_financials(ticker, cik, facts)
+
+            # SIC classification — best-effort. A failure here should never
+            # take down the financials fetch; it's a nice-to-have anchor
+            # fact for segment SAM classification, not a required field.
+            try:
+                submissions = self._fetch_submissions(cik)
+                if submissions:
+                    result.sic = submissions.get("sic")
+                    result.sic_description = submissions.get("sicDescription")
+            except Exception as exc:
+                logger.debug("[edgar] SIC lookup failed for %s: %s", ticker, exc)
+
             logger.info("[edgar] Fetched financials for %s (CIK %s)", ticker, cik)
             return result
 
@@ -133,6 +156,23 @@ class EdgarExtractor:
         time.sleep(0.1)
         url = f"{EDGAR_BASE}/api/xbrl/companyfacts/CIK{cik}.json"
         resp = self._client.get(url, timeout=30)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    def _fetch_submissions(self, cik: str) -> Optional[dict]:
+        """
+        Downloads the filer submissions/metadata JSON for a given CIK.
+        Used here only for its `sic` / `sicDescription` fields — SEC's own
+        structured, audited industry classification, e.g. Apple returns
+        sic="3571", sicDescription="Electronic Computers". This is a much
+        smaller payload than companyfacts (metadata + filing history, not
+        full financial data), but we still only need two fields out of it.
+        """
+        time.sleep(0.1)
+        url = f"{EDGAR_BASE}/submissions/CIK{cik}.json"
+        resp = self._client.get(url, timeout=20)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()

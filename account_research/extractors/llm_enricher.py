@@ -42,7 +42,9 @@ from ..extractors.web_search import SearchResult
 from ..extractors.edgar import EdgarFinancials
 from ..extractors.people_search import PersonProfile
 from ..extractors.patent_search import PatentInventor
-from ..extractors.segment_benchmarks import BENCHMARKS, guess_vertical, estimate_segment_sam
+from ..extractors.segment_benchmarks import (
+    BENCHMARKS, guess_vertical, estimate_segment_sam, sic_vertical_hint,
+)
 from ..extractors.grounding import text_contains_claim, number_grounded, is_url_grounded
 
 logger = logging.getLogger(__name__)
@@ -163,8 +165,12 @@ class LLMEnricher:
         # Segment SAM depends on overview (business description) and
         # economics (audited revenue, if any) already being extracted,
         # so it runs after both and merges into the economics section.
+        # edgar_data is passed through here for its sic/sic_description
+        # fields — an audited anchor fact for the vertical classification,
+        # not a substitute for the LLM's own judgment (see
+        # segment_benchmarks.py's SIC_VERTICAL_HINTS docstring for why).
         sections["economics"]["segment_sam_estimates"] = self._extract_segment_sam(
-            company_name, sections["overview"], by_topic
+            company_name, sections["overview"], by_topic, edgar_data
         )
 
         sections["account_intelligence"] = self._extract_account_intelligence(
@@ -433,6 +439,7 @@ Mark data_quality as "audited" only if from SEC filing.
         company_name: str,
         overview: dict,
         by_topic: dict[str, str],
+        edgar: Optional[EdgarFinancials] = None,
     ) -> list[dict]:
         """
         Two-step estimate of Power / EP / HPC / CONN / AMS SAM for this
@@ -441,7 +448,14 @@ Mark data_quality as "audited" only if from SEC filing.
           1. This method's LLM call ONLY identifies which benchmarked
              vertical fits the account and whether the source text
              discloses an annual unit volume. It is explicitly told to
-             return null rather than invent a number.
+             return null rather than invent a number. When available,
+             SEC's own SIC classification (audited, structured — not an
+             LLM guess) is given to the model as an anchor fact via
+             segment_benchmarks.sic_vertical_hint(), narrowing the likely
+             candidates without dictating the answer — SIC codes are
+             coarser than our vertical taxonomy (can't distinguish EV vs
+             ICE, or AI vs general-purpose servers), so this informs the
+             model's judgment rather than replacing it.
           2. A grounding check re-verifies that any returned unit volume
              actually appears in the source text — the LLM can comply
              with the "don't fabricate" instruction in spirit but still
@@ -457,11 +471,34 @@ Mark data_quality as "audited" only if from SEC filing.
         verticals = overview.get("industry_verticals", []) or []
         combined_source = f"{by_topic.get('overview', '')}\n{by_topic.get('financials', '')}"
 
+        sic_code = edgar.sic if edgar else None
+        sic_description = edgar.sic_description if edgar else None
+        hint = sic_vertical_hint(sic_code)
+
+        sic_block = ""
+        if sic_description:
+            if hint:
+                sic_block = f"""
+SEC FILER CLASSIFICATION (audited, structured fact from EDGAR — not a guess):
+SIC code {sic_code} ("{sic_description}"). Companies with this SIC code are
+usually one of: {", ".join(hint["candidates"])}. Use the source text below
+to decide which of these (if any) actually fits — SIC classification is too
+coarse to make this call by itself (e.g. it cannot distinguish an EV
+automaker from an ICE one, or an AI server maker from a general-purpose
+one), so don't treat this as the final answer on its own.
+"""
+            else:
+                sic_block = f"""
+SEC FILER CLASSIFICATION (audited, structured fact from EDGAR — not a guess):
+SIC code {sic_code} ("{sic_description}"). Not pre-mapped to any of the
+listed verticals below — use your own judgment on whether it's relevant.
+"""
+
         prompt = f"""
 Identify which semiconductor end-market vertical best fits "{company_name}"
 as a customer/OEM (not as a chip supplier), and find their most recent
 disclosed annual unit volume, if any.
-
+{sic_block}
 COMPANY SUMMARY:
 {summary}
 Industry verticals (as already extracted): {", ".join(verticals) or "(none extracted)"}
@@ -482,7 +519,7 @@ Return a JSON object with EXACTLY these fields:
 Rules:
 - vertical_key MUST be null if none of the listed options clearly fits this
   account's actual product/business — do not force a match onto the
-  closest-sounding option.
+  closest-sounding option, even if a SIC hint above suggests a candidate.
 - annual_unit_volume MUST be null unless the source text discloses or very
   strongly implies a specific figure (e.g. "vehicles produced last year",
   "base stations deployed", "servers shipped"). Never estimate, infer from
@@ -495,11 +532,17 @@ Rules:
 
         vertical_key = classification.get("vertical_key")
         if not vertical_key or vertical_key not in BENCHMARKS:
-            # Fall back to a cheap keyword guess rather than losing the
-            # estimate entirely — this is a hint, not an override of a
-            # confident LLM "null" (the LLM still returns null unit
-            # volume in that case, so no number gets fabricated either way).
-            vertical_key = guess_vertical(verticals, summary)
+            # Fallback order when the LLM returns null:
+            #   1. SIC hint, but ONLY if it unambiguously implies exactly
+            #      one candidate — an ambiguous SIC hint (e.g. "could be
+            #      auto_ice or auto_ev") isn't a safe deterministic
+            #      fallback, since picking either half of an ambiguous
+            #      pair is just as likely to be wrong as guessing blind.
+            #   2. The cheap keyword guess, same as before SIC existed.
+            if hint and len(hint["candidates"]) == 1:
+                vertical_key = hint["candidates"][0]
+            else:
+                vertical_key = guess_vertical(verticals, summary)
 
         unit_volume = classification.get("annual_unit_volume")
         reasoning   = classification.get("reasoning")

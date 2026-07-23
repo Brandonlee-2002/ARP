@@ -138,6 +138,70 @@ def guess_vertical(industry_verticals: list[str], summary: str) -> Optional[str]
 
 
 # ---------------------------------------------------------------------------
+# SEC SIC code → vertical hints.
+#
+# SEC's own filer classification (SIC code), fetched via EDGAR's submissions
+# endpoint — an audited, structured fact, not an LLM guess. Deliberately
+# NOT a 1:1 mapping to a single vertical_key: SIC codes are coarser than
+# our taxonomy. SIC 3711 ("Motor Vehicles & Passenger Car Bodies") covers
+# EV and ICE automakers alike, and SIC 3571 ("Electronic Computers") covers
+# both AI-server and general-purpose-server makers — SIC classification
+# can't make either distinction by itself. Each entry below lists the
+# CANDIDATE verticals a code typically implies; llm_enricher.py feeds this
+# to the classification prompt as an anchor fact ("SEC classifies this
+# filer as X, which usually means one of Y") and still relies on the
+# model + search context to pick the actual one, or reject all candidates.
+#
+# Coverage is a deliberate first pass, not comprehensive — SIC has ~1,000
+# codes; only ones plausibly relevant to the current six verticals are
+# mapped. Extend as new target companies surface SIC codes not covered
+# here, the same way BENCHMARKS itself is meant to grow.
+# ---------------------------------------------------------------------------
+SIC_VERTICAL_HINTS: dict[str, dict] = {
+    "3711": {"description": "Motor Vehicles & Passenger Car Bodies",
+             "candidates": ["auto_ice", "auto_ev"]},
+    "3714": {"description": "Motor Vehicle Parts & Accessories",
+             "candidates": ["auto_ice", "auto_ev"]},
+    "3571": {"description": "Electronic Computers",
+             "candidates": ["datacenter_ai_server", "datacenter_general_server"]},
+    "3572": {"description": "Computer Storage Devices",
+             "candidates": ["datacenter_ai_server", "datacenter_general_server"]},
+    "3663": {"description": "Radio & TV Broadcasting & Communications Equipment",
+             "candidates": ["telecom_infra"]},
+    "3669": {"description": "Communications Equipment, NEC",
+             "candidates": ["telecom_infra"]},
+    "3559": {"description": "Special Industry Machinery, NEC",
+             "candidates": ["industrial_automation"]},
+    "3625": {"description": "Relays & Industrial Controls",
+             "candidates": ["industrial_automation"]},
+    "3823": {"description": "Industrial Instruments for Measurement, Display, "
+                             "and Control of Process Variables",
+             "candidates": ["industrial_automation"]},
+}
+
+
+def sic_vertical_hint(sic_code: Optional[str]) -> Optional[dict]:
+    """
+    Looks up SIC_VERTICAL_HINTS for a given SIC code. Returns None if the
+    code is missing or not one of the (deliberately partial) mapped codes
+    — a miss here just means "no SIC-based hint available," not "this
+    company doesn't fit any vertical."
+
+    Defensive about formatting: EDGAR sources return SIC codes as plain
+    strings, sometimes without leading zeros, so normalize before lookup
+    rather than assume one exact format.
+    """
+    if not sic_code:
+        return None
+    raw = str(sic_code).strip()
+    code = raw.lstrip("0") or "0"
+    for candidate in (raw, code, code.zfill(4)):
+        if candidate in SIC_VERTICAL_HINTS:
+            return SIC_VERTICAL_HINTS[candidate]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Segment SAM allocation (pure math — no LLM involved)
 # ---------------------------------------------------------------------------
 
