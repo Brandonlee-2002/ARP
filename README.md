@@ -31,6 +31,38 @@ There's also a third, smaller artifact — `research_record_viewer.jsx` — whic
 
 ## Changelog
 
+### v1.4.1 — 2026-08-11
+
+**Added — a test suite, which is the reason the rest of this entry exists**
+
+- `tests/` (pytest, `pytest>=8.0` added to `requirements.txt`) with 48 offline tests plus network-marked live checks, split across `test_edgar.py`, `test_assembler.py`, `test_grounding.py` and `test_schema.py`. Offline tests use fake XBRL/FX payloads and never touch the network; `pytest.ini` registers a `network` marker so the live ones are skippable.
+- It carries a regression test for **every** bug found on 2026-08-10/11 — the stale-comparative-year sort, the ticker-map host, FX marking, unknown-ticker handling, the `EdgarFinancials` re-export identity, and the four-value `Segment` enum. Each of those shipped because nothing mechanical would have caught it. `requirements.txt` also had `anthropic`, `httpx` and `pydantic` listed twice; deduplicated.
+
+**Fixed — `fetch()` no longer hides hard failures behind a WARNING**
+
+- `EdgarExtractor.fetch()` wrapped everything in one blanket `except Exception`, logged a single WARNING, and returned `None` — conflating "this ticker isn't on EDGAR" (benign, a private company) with "our request is broken" (a bug). That is exactly how the `data.sec.gov` 404 stayed invisible while every record silently lost its financials. A genuinely absent ticker now logs at INFO; a hard failure (bad status on the ticker map or companyfacts, JSON/parse error, network error) logs at **ERROR** with the URL. Both still return `None` and never raise, so one company's failure can't take down a batch run. `tests/test_edgar.py` asserts the log level on both branches via `caplog`.
+
+**Fixed — FX conversion now matches accounting practice**
+
+- Income-statement (flow) items — revenue, gross profit, operating income, net income, R&D, capex — convert at the **period-average** ECB rate, computed from Frankfurter's date-range endpoint across the fiscal period. `total_assets_usd`, a balance-sheet item stated as of the period end, keeps the **period-end closing** rate. v1.4.0 used the closing rate for everything, which overstated ASML's FY2025 USD revenue by roughly $1.5B ($38.4B → $36.9B). Both rates are recorded, and each rate's failure nulls only the fields it was responsible for.
+- **The note now names the rate that actually produced each figure.** Splitting the rates initially left the note advertising only the closing rate, so back-calculating ASML's revenue from it gave €31,406M against a true €32,667M — off by ~€1.26B. `tests/test_assembler.py` now carries a round-trip assertion (divide the recorded figure by the rate the note names, recover the filed figure), because that absence is why it slipped through in the first place.
+
+**Fixed — the grounding pass is running again**
+
+- `extractors/grounding.py` was orphaned during the four-stage restructure: imported by nothing, so nothing re-checked that a stakeholder name, figure, or news URL traced back to real retrieved text. Now wired back into `llm_enricher.py`. An ungrounded stakeholder name becomes a role-title placeholder (the stakeholder is kept, not dropped), an ungrounded news URL drops the item, and an ungrounded LLM figure is nulled. Each action logs one INFO line.
+- **Stakeholder names ground against the web snippets *or* the Apollo/PDL contact list.** `enrich()` gained a `programmatic_contacts` parameter for this, threaded from stage 2b. Checking snippets alone would have deleted real verified contacts, who frequently have no web presence — a safety check that silently destroys your best data is worse than none.
+- **EDGAR-sourced figures are exempt from number-grounding.** They come from a filing, not from search text; grounding them against snippets would null a filed figure for not appearing in a blog post.
+
+**Fixed — `Stakeholder.verified` is set again**
+
+- Nothing populated it, so it was always `False` — reading as "this account has no verified contacts" rather than "that signal is off". LLM-extracted stakeholders are now matched against the Apollo/PDL contacts by normalized name (exact, then surname fallback, case-insensitive); a match sets `verified=True` and lets the structured contact override the LLM's title, email, LinkedIn and location. A contact the LLM never surfaced is still added rather than dropped.
+- A grounding placeholder such as `"VP of Procurement (name not found)"` can **never** match a contact — otherwise `verified=True` would be stamped on a name the model invented, inverting the flag's meaning. The check happens before name normalization, since normalization strips the parentheses and the remaining token can collide with a real surname.
+
+**Fixed — the viewer's dead segment-SAM state**
+
+- `research_record_viewer.jsx`'s sample fixture still contained a `segment: "conn"` entry that the four-value `Segment` enum rejects; removed, with its rationale folded into the `ams` entry. `SEGMENT_LABELS` and `SEGMENT_ORDER` dropped their `conn` keys. When `segment_sam_estimates` is empty — which it now always is — the section renders an explicit note saying the stage was retired, instead of a grid of blank placeholders.
+- `src/app.jsx` needed no change: it never had the segment-SAM feature in any committed revision.
+
 ### v1.4.0 — 2026-08-11
 
 **Changed — pipeline reduced from seven stages to four**
@@ -44,7 +76,8 @@ There's also a third, smaller artifact — `research_record_viewer.jsx` — whic
 - **Ticker-to-CIK lookup 404'd on every call.** `files/company_tickers.json` was requested from `data.sec.gov`, which returns 404 for that path; SEC serves it from `www.sec.gov`. Because `fetch()` turns a hard failure into one WARNING and returns `None`, *every* run silently produced a record with no EDGAR financials and no SIC anchor — making the v1.3.1 SIC work dead code in practice. A separate `SEC_WWW_BASE` constant is now used for that one lookup; `EDGAR_BASE` stays `data.sec.gov` for `submissions/` and `api/xbrl/`, which are correct there.
 - **Financials were two years stale.** A 10-K carries comparative figures for three fiscal years, all sharing one `filed` date. `_latest_annual_entry` sorted by `filed` alone and took the first result — and since Python's sort is stable, equal keys kept array order, returning the *oldest* period in the filing. Intel reported `FY2023 $54.228B` when the correct current figure was `FY2025 $52.853B`. Note the direction: Intel's revenue is declining, so the bug silently **overstated** a target's size. Now sorted by period `end` descending, with `filed` as the tiebreaker so a restated period still prefers the newer filing.
 - **Foreign filers reporting in a non-USD currency returned nothing.** Only `units["USD"]` was ever read, so ASML (which reports revenue in EUR) resolved a CIK and then left every financial field `None`. Now converts via **ECB reference rates** (Frankfurter, no API key, historical dates), fetched for the fiscal period's end date, with `reporting_currency` / `fx_rate_to_usd` / `fx_rate_date` / `fx_rate_source` recorded alongside. ECB covers ~30 currencies and **not TWD**, so a Taiwan-domiciled filer is genuinely unconvertible — in that case the USD fields stay `None` and a WARNING is logged rather than an approximate rate being substituted.
-- **A converted figure is never labelled audited.** `assembler.py` now stamps `data_quality = "estimated"` and writes a `Financials.notes` string — e.g. `"Converted from EUR at 1.175 (2025-12-31, source: ECB)"` — whenever `fx_rate_to_usd` is set. The USD path is unchanged at `"audited"` with no note. **Caveat:** one period-end closing rate is used for all figures. Accounting practice converts income-statement items at a period-*average* rate and only balance-sheet items at the closing rate, so revenue converted this way carries real translation error in a volatile year. The `estimated` marking plus the recorded rate is the mitigation, not a correction.
+- **Two rates, matched to the kind of figure.** Income-statement (flow) items — revenue, gross profit, operating income, net income, R&D, capex — convert at the **period-average** ECB rate, computed from Frankfurter's date-range endpoint across the fiscal period. `total_assets_usd`, a balance-sheet item stated as of the period end, converts at the **period-end closing** rate. This follows accounting practice; an earlier revision used the closing rate for everything, which for ASML's FY2025 overstated USD revenue by roughly $1.5B. Both rates are recorded (`fx_rate_to_usd` / `fx_rate_date` for closing, `fx_rate_avg_to_usd` / `fx_rate_avg_start` / `fx_rate_avg_end` for average), and each rate's failure nulls only the fields it was responsible for.
+- **A converted figure is never labelled audited, and the note names the rate that produced it.** `assembler.py` stamps `data_quality = "estimated"` whenever either FX rate is set, and writes a `Financials.notes` string identifying both rates and which figures each one converted — so a reader can divide back out and recover the filed figure. The USD path is unchanged at `"audited"` with no note.
 
 **Fixed — packaging and imports**
 
@@ -231,7 +264,7 @@ The more user-friendly of the two options — no terminal, no installation, no A
 - **Re-saving a company you've already researched replaces the old profile** instead of creating a duplicate — matched by domain, not by the internal record ID (which is always freshly generated per run).
 - **Download report** — generates a standalone HTML file and triggers a real browser download (not a same-tab open, which sandboxed artifacts can't do) with a filesystem-safe name derived from company + date; open it and use your browser's Ctrl+P → Save as PDF to get an actual PDF.
 
-Note: `app.jsx` does not have a segment SAM tab, the grounding checks, or the `verified` stakeholder flag. That used to be a gap relative to the Python side; as of v1.4.0 all three are inactive there too (segment SAM and grounding are retired/unwired, and `verified` is no longer set), so the two implementations have converged on this point by subtraction rather than by addition. `app.jsx` remains fully independent by design.
+Note: `app.jsx` does not have a segment SAM tab, the grounding checks, or the `verified` stakeholder flag. Segment SAM is retired on the Python side too, so that one is no longer a gap — but grounding and `verified` are both active in the Python pipeline as of v1.4.1, so records produced there carry provenance signals `app.jsx` neither produces nor displays. `app.jsx` remains fully independent by design, so this is a scope boundary rather than a bug — but don't assume a record from the browser path has been source-checked the way a Python-produced one has.
 
 ### Recent fixes
 
@@ -282,7 +315,7 @@ Four stages run in sequence, each independently fault-tolerant:
 1. **Web search** — fires targeted queries across topics (overview, locations, stakeholders, financials, semiconductor profile, news) using Serper, Brave Search, or SerpAPI.
 2. **SEC EDGAR** — for US-listed companies, fetches audited 10-K / 20-F financials directly from EDGAR's public XBRL API, plus the filer's SIC classification. No API key required. Picks the latest reporting *period* (not merely the latest filing — a 10-K contains three comparative years), and converts a non-USD filer's figures to USD at the period-end ECB reference rate, recording the currency, rate, date and source so a converted figure is never mistaken for a filed one.
    - **2b. Programmatic contacts** *(optional)* — if `APOLLO_API_KEY` and/or `PDL_API_KEY` is set, pulls structured contact records from Apollo.io and People Data Labs, filtered toward engineering/technical roles, normalizes and dedupes across providers, and infers role type and influence from title/seniority. Web search alone tends to surface only people who've been written about (CEOs, VPs); individual contributors don't appear there. Skipped cleanly if neither key is set.
-3. **LLM enrichment** — Claude makes one focused call per schema section (overview, locations, stakeholders, economics, account intelligence, news), returning JSON. EDGAR numbers override LLM estimates where both exist, and the programmatic contacts anchor the stakeholder prompt so Claude prefers real names and titles over inference.
+3. **LLM enrichment** — Claude makes one focused call per schema section (overview, locations, stakeholders, economics, account intelligence, news), returning JSON. EDGAR numbers override LLM estimates where both exist. Note that `enrich()` receives only the search results and EDGAR data — the programmatic contacts are **not** passed into the stakeholder prompt, they are merged later in stage 4.
 4. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output. The merge rule throughout is: structured source > LLM estimate > null.
 
 ---
@@ -304,7 +337,7 @@ The JSON record follows a versioned schema (`v1.4.0`) with these top-level secti
 | `meta` | Schema version, timestamps, per-section confidence scores, source citations |
 | `overview` | Legal name, ticker, founding year, headcount, industry verticals, summary |
 | `locations` | HQ, fabs, R&D centers, sales offices — typed and status-tagged |
-| `stakeholders` | Decision-makers with role type, influence score, and buying relevance notes. The `verified` field still exists on the model but is **no longer set by anything** as of v1.4.0 |
+| `stakeholders` | Decision-makers with role type, influence score, and buying relevance notes, plus a `verified` flag — true when the name matched an Apollo/PDL contact record rather than being inferred from web text. An ungrounded name appears as a role-title placeholder, e.g. `"VP of Procurement (name not found)"`, and is never `verified` |
 | `economics` | Revenue, margins, R&D spend, capex, disclosed segment breakdown, and semiconductor profile. `data_quality` reads `estimated` (with a `notes` string naming the rate) when the figures were FX-converted from a non-USD filing. `segment_sam_estimates` remains in the schema but has **no producer** as of v1.4.0 and will be empty |
 | `account_intelligence` | Opportunity signals, risks, watch items, recommended next action |
 | `news` | Up to 10 recent items tagged by topic |
@@ -484,17 +517,18 @@ Note that a `high` on `economics` means the figures came from EDGAR — includin
 
 ## Grounding safeguards
 
-> **⚠ Not currently active (as of v1.4.0).** `extractors/grounding.py` is on disk
-> but is imported by nothing — neither `llm_enricher.py` nor `assembler.py` calls
-> it, and no equivalent check was reimplemented inline. Everything below describes
-> how the grounding pass worked when it was wired in, and remains an accurate
-> description of the module itself.
+> **Active again as of v1.4.1.** `extractors/grounding.py` was briefly orphaned
+> during the four-stage restructure — imported by nothing, so nothing re-checked
+> that a stakeholder name, figure, or news URL traced back to anything real. It is
+> now wired back into `llm_enricher.py` and runs on every enrichment.
 >
-> Unlike the FCC, patent and segment-SAM retirements, this is a **safety
-> mechanism rather than a feature**: with it unwired, nothing re-checks that a
-> stakeholder name, unit volume, or news URL traces back to something real. Until
-> it is re-wired or replaced, treat stakeholder names and news links in any record
-> as LLM-asserted and unverified.
+> Two details differ from the original wiring described below. Stakeholder names
+> are grounded against the web snippets **or** the programmatic Apollo/PDL contact
+> list — checking snippets alone would delete real verified contacts, who
+> frequently have no web presence at all. And LLM-derived economics figures are
+> grounded, while EDGAR-sourced figures are exempt: those are audited, and
+> grounding them against search snippets would null a filed number for the crime
+> of not appearing in a blog post.
 
 Pydantic validation (in `assembler.py`) checks that LLM output has the right **shape** — it says nothing about whether the content is **true**. A well-formed, schema-valid stakeholder name, disclosed unit volume, or news URL can still be entirely invented by the model.
 
