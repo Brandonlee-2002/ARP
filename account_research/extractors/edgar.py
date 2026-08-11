@@ -18,6 +18,7 @@ import logging
 import ssl
 import time
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 
 import httpx
@@ -68,9 +69,15 @@ class EdgarFinancials:
     # _fetch_fx_rate. All four stay None on the USD path, unchanged from
     # pre-T-008 behavior.
     reporting_currency:   Optional[str]   = None
-    fx_rate_to_usd:       Optional[float] = None
+    fx_rate_to_usd:       Optional[float] = None   # period-end closing rate
     fx_rate_date:         Optional[str]   = None
     fx_rate_source:       Optional[str]   = None
+    # Period-average rate — used for flow (income-statement) items instead
+    # of the closing rate above. See _fetch_fx_rate_average and T-018.
+    fx_rate_avg_to_usd:   Optional[float] = None
+    fx_rate_avg_start:    Optional[str]   = None
+    fx_rate_avg_end:      Optional[str]   = None
+    fx_rate_avg_source:   Optional[str]   = None
     # SEC's own structured filer classification — NOT a financial figure,
     # but bundled here since it comes from the same free CIK-based lookup
     # path and there's no other natural home for it. Used to give the
@@ -113,14 +120,33 @@ class EdgarExtractor:
         """
         Main entry point. Returns None if the company isn't found on EDGAR
         (e.g. it's a foreign private issuer not cross-listed on US exchanges,
-        or it's private).
+        or it's private) — logged at INFO, since that outcome is expected
+        and benign, not a bug.
+
+        Any other failure (a broken ticker-map/companyfacts request, an
+        unexpected HTTP status, a malformed payload) is a *hard* failure —
+        it means our request is broken, not that this ticker doesn't exist —
+        and is logged at ERROR with the URL involved. It still returns None
+        rather than raising, so one company's failure never takes down a
+        batch run; but ERROR (not WARNING) means it won't go unnoticed the
+        way the data.sec.gov 404 previously did.
         """
+        ticker_map_url = f"{SEC_WWW_BASE}/files/company_tickers.json"
         try:
             cik = self._resolve_cik(ticker)
-            if not cik:
-                logger.info("[edgar] No CIK found for %s — skipping", ticker)
-                return None
+        except Exception as exc:
+            logger.error(
+                "[edgar] Ticker lookup failed for %s at %s: %s",
+                ticker, ticker_map_url, exc,
+            )
+            return None
 
+        if not cik:
+            logger.info("[edgar] No CIK found for %s — skipping", ticker)
+            return None
+
+        facts_url = f"{EDGAR_BASE}/api/xbrl/companyfacts/CIK{cik}.json"
+        try:
             facts = self._fetch_facts(cik)
             if not facts:
                 return None
@@ -142,7 +168,10 @@ class EdgarExtractor:
             return result
 
         except Exception as exc:
-            logger.warning("[edgar] Failed for %s: %s", ticker, exc)
+            logger.error(
+                "[edgar] Hard failure fetching financials for %s (CIK %s) at %s: %s",
+                ticker, cik, facts_url, exc,
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -269,33 +298,68 @@ class EdgarExtractor:
         if not revenue_result:
             return result
 
-        period_end = revenue_entry.get("end")
-        rate = self._fetch_fx_rate(currency, period_end)
-        if not rate:
+        period_end   = revenue_entry.get("end")
+        period_start = self._period_start(revenue_entry)
+
+        # Two independent rates for two different kinds of figure:
+        #   - closing (period-end)   -> total_assets_usd (a balance-sheet /
+        #     stock item, stated as of the period end)
+        #   - average (period-range) -> revenue/gross profit/operating
+        #     income/net income/R&D/capex (flow items spanning the fiscal
+        #     period). See T-018 / docs/NOTES.md.
+        closing = self._fetch_fx_rate(currency, period_end)
+        average = self._fetch_fx_rate_average(currency, period_start, period_end)
+
+        if not closing and not average:
             logger.warning(
-                "[edgar] No USD conversion rate available for %s as of %s "
-                "— leaving *_usd fields None for %s",
+                "[edgar] No USD conversion rate (closing or period-average) "
+                "available for %s as of %s — leaving *_usd fields None for %s",
                 currency, period_end, ticker,
             )
             return result
 
-        rate_value, rate_date = rate
-        result.fx_rate_to_usd = rate_value
-        result.fx_rate_date   = rate_date
-        result.fx_rate_source = (
-            f"ECB reference rate via Frankfurter (api.frankfurter.dev), {rate_date}"
-        )
+        if closing:
+            rate_value, rate_date = closing
+            result.fx_rate_to_usd = rate_value
+            result.fx_rate_date   = rate_date
+            result.fx_rate_source = (
+                f"ECB reference rate via Frankfurter (api.frankfurter.dev), {rate_date}"
+            )
+            result.total_assets_usd = (
+                raw_total_assets * rate_value if raw_total_assets is not None else None
+            )
+        else:
+            logger.warning(
+                "[edgar] No closing USD rate available for %s as of %s — "
+                "leaving total_assets_usd None for %s",
+                currency, period_end, ticker,
+            )
 
-        def _to_usd(raw_value: Optional[float]) -> Optional[float]:
-            return raw_value * rate_value if raw_value is not None else None
+        if average:
+            avg_value, avg_start, avg_end = average
+            result.fx_rate_avg_to_usd = avg_value
+            result.fx_rate_avg_start  = avg_start
+            result.fx_rate_avg_end    = avg_end
+            result.fx_rate_avg_source = (
+                f"ECB reference rate via Frankfurter (api.frankfurter.dev), "
+                f"period average {avg_start}..{avg_end}"
+            )
 
-        result.revenue_usd          = _to_usd(raw_revenue)
-        result.gross_profit_usd     = _to_usd(raw_gross_profit)
-        result.operating_income_usd = _to_usd(raw_operating_income)
-        result.net_income_usd       = _to_usd(raw_net_income)
-        result.rd_expense_usd       = _to_usd(raw_rd_expense)
-        result.capex_usd            = _to_usd(raw_capex)
-        result.total_assets_usd     = _to_usd(raw_total_assets)
+            def _to_usd_avg(raw_value: Optional[float]) -> Optional[float]:
+                return raw_value * avg_value if raw_value is not None else None
+
+            result.revenue_usd          = _to_usd_avg(raw_revenue)
+            result.gross_profit_usd     = _to_usd_avg(raw_gross_profit)
+            result.operating_income_usd = _to_usd_avg(raw_operating_income)
+            result.net_income_usd       = _to_usd_avg(raw_net_income)
+            result.rd_expense_usd       = _to_usd_avg(raw_rd_expense)
+            result.capex_usd            = _to_usd_avg(raw_capex)
+        else:
+            logger.warning(
+                "[edgar] No period-average USD rate available for %s over "
+                "%s..%s — leaving flow *_usd fields None for %s",
+                currency, period_start, period_end, ticker,
+            )
 
         return result
 
@@ -386,6 +450,75 @@ class EdgarExtractor:
                 currency, period_end, exc,
             )
             return None
+
+    def _fetch_fx_rate_average(
+        self, currency: str, period_start: Optional[str], period_end: Optional[str]
+    ) -> Optional[tuple[float, str, str]]:
+        """
+        Period-average ECB reference rate converting `currency` -> USD over
+        [period_start, period_end], via Frankfurter's date-range endpoint
+        (`GET /v1/{start}..{end}?base={cur}&symbols=USD`), which returns one
+        entry per ECB business day in the range. The simple mean of those
+        daily rates is the period-average rate applied to flow
+        (income-statement) items — see the flow-vs-stock note in
+        `_extract_financials` and T-018.
+
+        Returns None — never a guessed or hardcoded rate — if either date is
+        missing, the currency isn't one of ECB's ~30 reference currencies
+        (e.g. TWD), the request fails, or the range contains no rates at all
+        (e.g. a malformed or empty response).
+        """
+        if not period_start or not period_end:
+            return None
+        try:
+            resp = self._client.get(
+                f"{FRANKFURTER_BASE}/{period_start}..{period_end}",
+                params={"base": currency, "symbols": "USD"},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            daily_rates = [
+                day_rates["USD"]
+                for day_rates in data.get("rates", {}).values()
+                if day_rates.get("USD") is not None
+            ]
+            if not daily_rates:
+                return None
+            avg_rate = sum(daily_rates) / len(daily_rates)
+            start_date = data.get("start_date") or period_start
+            end_date   = data.get("end_date") or period_end
+            return float(avg_rate), start_date, end_date
+        except Exception as exc:
+            logger.warning(
+                "[edgar] Period-average FX lookup failed for %s -> USD over "
+                "%s..%s: %s",
+                currency, period_start, period_end, exc,
+            )
+            return None
+
+    def _period_start(self, entry: dict) -> Optional[str]:
+        """
+        The fiscal-period start date for a duration XBRL fact. Prefers the
+        entry's own `start` field (duration concepts like revenue carry
+        one); falls back to the `end` date minus one calendar year when
+        `start` is absent, per T-018.
+        """
+        start = entry.get("start")
+        if start:
+            return start
+        end = entry.get("end")
+        if not end:
+            return None
+        try:
+            year, month, day = (int(part) for part in end.split("-"))
+        except (ValueError, AttributeError):
+            return None
+        try:
+            return date(year - 1, month, day).isoformat()
+        except ValueError:
+            # end date was Feb 29 and (year - 1) isn't a leap year.
+            return date(year - 1, month, day - 1).isoformat()
 
     def close(self) -> None:
         self._client.close()
