@@ -8,14 +8,12 @@ Uses a simple rate-limiting wrapper so the pipeline doesn't hammer the API.
 
 from __future__ import annotations
 
-import ssl
 import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
-import truststore
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +41,6 @@ class WebSearchExtractor:
     timeout:        int   = 15
 
     _last_call: float = field(default=0.0, init=False, repr=False)
-    # Built once per instance and reused across every provider call below —
-    # see edgar.py for why verify=truststore's SSLContext is needed instead
-    # of httpx's default bundled certifi list.
-    _ssl_context: ssl.SSLContext = field(
-        default_factory=lambda: truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
-        init=False, repr=False,
-    )
 
     # ------------------------------------------------------------------
     # Public API
@@ -93,6 +84,8 @@ class WebSearchExtractor:
             # Stakeholders
             ("stakeholders",  f"{name} executive team CTO CEO procurement leadership"),
             ("stakeholders",  f"{name} VP semiconductor engineering supply chain"),
+            ("stakeholders",  f"{name} \"principal engineer\" OR \"staff engineer\" OR \"senior engineer\""),
+            ("stakeholders",  f"site:linkedin.com/in {name} process engineer OR device engineer OR test engineer"),
 
             # Economics — public filings preferred, then news
             ("financials",    f"{name} annual revenue profit margin R&D spend 2024 2025"),
@@ -131,7 +124,6 @@ class WebSearchExtractor:
             headers={"X-API-KEY": self.api_key, "Content-Type": "application/json"},
             json={"q": query, "num": 5},
             timeout=self.timeout,
-            verify=self._ssl_context,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -151,7 +143,6 @@ class WebSearchExtractor:
             headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
             params={"q": query, "count": 5},
             timeout=self.timeout,
-            verify=self._ssl_context,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -170,7 +161,6 @@ class WebSearchExtractor:
             "https://serpapi.com/search",
             params={"q": query, "api_key": self.api_key, "num": 5, "engine": "google"},
             timeout=self.timeout,
-            verify=self._ssl_context,
         )
         resp.raise_for_status()
         data = resp.json()

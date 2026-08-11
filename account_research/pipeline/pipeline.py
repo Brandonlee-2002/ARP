@@ -10,17 +10,6 @@ Environment variables:
     ANTHROPIC_API_KEY   — required
     SEARCH_API_KEY      — required (for web search)
     SEARCH_PROVIDER     — "serper" | "brave" | "serpapi"  (default: serper)
-    PDL_API_KEY         — optional (enables verified stakeholder contacts
-                           via People Data Labs; pipeline behaves exactly
-                           as without it when unset)
-    FCC_APP_TOKEN       — optional (raises the FCC Socrata rate limit;
-                           the FCC facility-lookup stage runs with or
-                           without this — it needs no key at all)
-    USPTO_API_KEY       — optional (enables patent-inventor lookup via
-                           USPTO's Open Data Portal; pipeline behaves
-                           exactly as without it when unset). Requires a
-                           USPTO.gov account verified through ID.me — see
-                           extractors/patent_search.py's module docstring.
 """
 
 from __future__ import annotations
@@ -35,24 +24,13 @@ from typing import Optional
 import anthropic
 
 from ..extractors.edgar import EdgarExtractor
-from ..extractors.fcc_search import FccSearchExtractor
 from ..extractors.llm_enricher import LLMEnricher
-from ..extractors.patent_search import PatentSearchExtractor, segment_patent_activity
-from ..extractors.people_search import PeopleSearchExtractor
 from ..extractors.web_search import WebSearchExtractor
+from ..extractors.people_data import PeopleDataExtractor
 from ..models.schema import AccountResearchRecord
 from .assembler import RecordAssembler
 
 logger = logging.getLogger(__name__)
-
-SEGMENT_LABELS = {
-    "power": "Power",
-    "ep":    "Embedded Processing",
-    "hpc":   "High-Performance Compute",
-    "conn":  "Connectivity",
-    "ams":   "Analog & Mixed-Signal",
-}
-SEGMENT_ORDER = ["power", "ep", "hpc", "conn", "ams"]
 
 
 class AccountResearchPipeline:
@@ -61,29 +39,9 @@ class AccountResearchPipeline:
 
         1. Web search  — broad multi-query scrape across all topics
         2. EDGAR       — audited financials for public companies
-        3. People search (optional) — verified decision-maker contacts via
-                          People Data Labs; skipped entirely if PDL_API_KEY
-                          isn't set
-        4. FCC facility lookup — corroborates/adds design-center-relevant
-                          locations from FCC equipment authorization
-                          grantee registrations; always runs, no key
-                          required (only surfaces anything for companies
-                          with RF/wireless products — see fcc_search.py)
-        5. Patent search (optional) — inventor names + segment-classified
-                          patent activity via USPTO's Open Data Portal;
-                          skipped entirely if USPTO_API_KEY isn't set.
-                          Deliberately NOT treated like PDL: a patent
-                          inventor match only ever corroborates an
-                          existing stakeholder with a note — it never adds
-                          a new stakeholder record the way an unmatched
-                          verified PDL contact does, since a patent proves
-                          someone invented something at some point, not
-                          that they still work there.
-        6. LLM enrich  — section-by-section structured extraction
-                          (includes benchmark-derived segment SAM estimates;
-                          verified contacts anchor the stakeholder prompt)
-        7. Assemble    — validate, merge, score confidence
-        8. Save        — write JSON + summary to disk
+        3. LLM enrich  — section-by-section structured extraction
+        4. Assemble    — validate, merge, score confidence
+        5. Save        — write JSON + summary to disk
 
     All stages are independently fault-tolerant.
     """
@@ -93,9 +51,7 @@ class AccountResearchPipeline:
         anthropic_client: anthropic.Anthropic,
         search_api_key:   str,
         search_provider:  str = "serper",
-        people_search_api_key: Optional[str] = None,
-        fcc_app_token: Optional[str] = None,
-        uspto_api_key: Optional[str] = None,
+        people_data_extractor: Optional[PeopleDataExtractor] = None,
     ):
         self._llm       = LLMEnricher(client=anthropic_client)
         self._web       = WebSearchExtractor(
@@ -103,17 +59,7 @@ class AccountResearchPipeline:
             provider=search_provider,
         )
         self._edgar     = EdgarExtractor()
-        self._people    = (
-            PeopleSearchExtractor(api_key=people_search_api_key)
-            if people_search_api_key else None
-        )
-        # FCC needs no key at all — always constructed. fcc_app_token is
-        # an optional Socrata rate-limit raiser, not an enable/disable switch.
-        self._fcc       = FccSearchExtractor(app_token=fcc_app_token)
-        self._patents   = (
-            PatentSearchExtractor(api_key=uspto_api_key)
-            if uspto_api_key else None
-        )
+        self._people    = people_data_extractor
         self._assembler = RecordAssembler()
 
     # ------------------------------------------------------------------
@@ -126,9 +72,6 @@ class AccountResearchPipeline:
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         search_key    = os.environ.get("SEARCH_API_KEY")
         provider      = os.environ.get("SEARCH_PROVIDER", "serper")
-        pdl_key       = os.environ.get("PDL_API_KEY")      # optional
-        fcc_token     = os.environ.get("FCC_APP_TOKEN")    # optional
-        uspto_key     = os.environ.get("USPTO_API_KEY")    # optional
 
         if not anthropic_key:
             raise ValueError("ANTHROPIC_API_KEY environment variable not set")
@@ -139,9 +82,7 @@ class AccountResearchPipeline:
             anthropic_client=anthropic.Anthropic(api_key=anthropic_key),
             search_api_key=search_key,
             search_provider=provider,
-            people_search_api_key=pdl_key,
-            fcc_app_token=fcc_token,
-            uspto_api_key=uspto_key,
+            people_data_extractor=PeopleDataExtractor.from_env(),
         )
 
     # ------------------------------------------------------------------
@@ -174,7 +115,7 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         # Stage 1: Web search
         # ------------------------------------------------------------------
-        logger.info("[Stage 1/7] Web search...")
+        logger.info("[Stage 1/4] Web search...")
         search_results = self._web.fetch_all(company_name, domain)
         logger.info("  → %d search snippets collected", len(search_results))
 
@@ -185,7 +126,7 @@ class AccountResearchPipeline:
         # ------------------------------------------------------------------
         edgar_data = None
         if ticker:
-            logger.info("[Stage 2/7] EDGAR lookup for ticker %s...", ticker)
+            logger.info("[Stage 2/4] EDGAR lookup for ticker %s...", ticker)
             edgar_data = self._edgar.fetch(ticker)
             if edgar_data:
                 logger.info(
@@ -196,58 +137,34 @@ class AccountResearchPipeline:
             else:
                 logger.info("  → No EDGAR data found (private company or foreign issuer)")
         else:
-            logger.info("[Stage 2/7] Skipping EDGAR (no ticker provided)")
+            logger.info("[Stage 2/4] Skipping EDGAR (no ticker provided)")
 
         # ------------------------------------------------------------------
-        # Stage 3: People search (optional — requires PDL_API_KEY)
+        # Stage 2b: Programmatic contacts (Apollo / PDL) — optional
         # ------------------------------------------------------------------
-        pdl_contacts = []
+        programmatic_stakeholders: list[dict] = []
         if self._people:
-            logger.info("[Stage 3/7] People search (People Data Labs)...")
-            pdl_contacts = self._people.search(company_name, domain)
-            logger.info("  → %d verified contacts found", len(pdl_contacts))
+            logger.info("[Stage 2b/4] Fetching contacts from Apollo/PDL...")
+            programmatic_stakeholders = self._people.fetch(company_name, domain, target_count=20)
+            logger.info("  → %d contacts retrieved", len(programmatic_stakeholders))
         else:
-            logger.info("[Stage 3/7] Skipping people search (PDL_API_KEY not set)")
+            logger.info("[Stage 2b/4] Skipping programmatic contacts (Apollo/PDL not configured)")
 
         # ------------------------------------------------------------------
-        # Stage 4: FCC facility lookup (always runs — no key required)
+        # Stage 3: LLM enrichment
         # ------------------------------------------------------------------
-        logger.info("[Stage 4/7] FCC facility lookup...")
-        fcc_facilities = self._fcc.search(company_name)
-        if fcc_facilities:
-            logger.info("  → %d FCC-registered facility record(s) found", len(fcc_facilities))
-        else:
-            logger.info("  → No FCC equipment authorization records found "
-                        "(expected for companies with no RF/wireless products)")
-
-        # ------------------------------------------------------------------
-        # Stage 5: Patent search (optional — requires USPTO_API_KEY)
-        # ------------------------------------------------------------------
-        patent_inventors = []
-        if self._patents:
-            logger.info("[Stage 5/7] Patent search (USPTO Open Data Portal)...")
-            patent_inventors = self._patents.search(company_name)
-            logger.info("  → %d distinct patent inventor(s) found", len(patent_inventors))
-        else:
-            logger.info("[Stage 5/7] Skipping patent search (USPTO_API_KEY not set)")
-
-        # ------------------------------------------------------------------
-        # Stage 6: LLM enrichment
-        # ------------------------------------------------------------------
-        logger.info("[Stage 6/7] LLM enrichment (6 sections + segment SAM)...")
+        logger.info("[Stage 3/4] LLM enrichment (6 sections)...")
         enriched = self._llm.enrich(
             company_name=company_name,
             domain=domain,
             search_results=search_results,
             edgar_data=edgar_data,
-            pdl_contacts=pdl_contacts,
-            patent_inventors=patent_inventors,
         )
 
         # ------------------------------------------------------------------
-        # Stage 7: Assemble and validate
+        # Stage 4: Assemble and validate
         # ------------------------------------------------------------------
-        logger.info("[Stage 7/7] Assembling and validating record...")
+        logger.info("[Stage 4/4] Assembling and validating record...")
         record = self._assembler.assemble(
             company_name=company_name,
             domain=domain,
@@ -255,18 +172,15 @@ class AccountResearchPipeline:
             edgar_data=edgar_data,
             search_sources=search_sources,
             refresh_cadence=refresh_cadence,
-            pdl_contacts=pdl_contacts,
-            fcc_facilities=fcc_facilities,
-            patent_inventors=patent_inventors,
+            programmatic_stakeholders=programmatic_stakeholders,
         )
 
         logger.info("Pipeline complete.")
         logger.info(
-            "  Confidence: %s | Locations: %d | Stakeholders: %d (%d verified) | News items: %d",
+            "  Confidence: %s | Locations: %d | Stakeholders: %d | News items: %d",
             record.meta.confidence.overall,
             len(record.locations),
             len(record.stakeholders),
-            sum(1 for s in record.stakeholders if s.verified),
             len(record.news),
         )
 
@@ -333,17 +247,8 @@ class AccountResearchPipeline:
         def _fmt_m(v: Optional[float]) -> str:
             return f"${v:,.0f}M" if v else "N/A"
 
-        def _fmt_range(lo: Optional[float], hi: Optional[float]) -> str:
-            if lo is None and hi is None:
-                return "N/A — needs research"
-            if lo is None:
-                return f"up to {_fmt_m(hi)}"
-            if hi is None:
-                return f"{_fmt_m(lo)}+"
-            return f"{_fmt_m(lo)} – {_fmt_m(hi)}"
-
         stakeholder_lines = "\n".join(
-            f"  - **{s.name}**{' ✓' if s.verified else ''} ({s.title}) — {s.role_type} | influence: {s.influence_score:.0%}"
+            f"  - **{s.name}** ({s.title}) — {s.role_type} | influence: {s.influence_score:.0%}"
             for s in r.stakeholders[:6]
         )
 
@@ -351,7 +256,6 @@ class AccountResearchPipeline:
             f"  - [{loc.type.upper()}] {loc.city}, {loc.country}"
             + (f" — {loc.name}" if loc.name else "")
             + (f" ({loc.status})" if loc.status != "active" else "")
-            + (" 📡 FCC-registered" if loc.notes and "FCC equipment authorization" in loc.notes else "")
             for loc in r.locations[:8]
         )
 
@@ -370,26 +274,6 @@ class AccountResearchPipeline:
             + (" ✓ relevant" if seg.relevant_to_us else "")
             for seg in r.economics.revenue_segments
         )
-
-        # Segment SAM estimates — always rendered separately from the
-        # audited financials above, with the benchmark confidence and
-        # source visible on every line so a reader never mistakes an
-        # estimate for a disclosed figure.
-        sam_lines = "\n".join(
-            f"  - **{SEGMENT_LABELS.get(est.segment, est.segment)}**: "
-            f"{_fmt_range(est.estimated_sam_low_usd_m, est.estimated_sam_high_usd_m)} "
-            f"*({est.benchmark_confidence})* — {est.unit_basis or 'no basis computed'}"
-            for est in sorted(
-                r.economics.segment_sam_estimates,
-                key=lambda e: SEGMENT_ORDER.index(e.segment) if e.segment in SEGMENT_ORDER else 99,
-            )
-        )
-        sam_sources = sorted({
-            est.benchmark_source for est in r.economics.segment_sam_estimates if est.benchmark_source
-        })
-
-        verified_count = sum(1 for s in r.stakeholders if s.verified)
-        stakeholder_note = f" ({verified_count} verified ✓)" if verified_count else ""
 
         return f"""# Account research: {ov.legal_name}
 *Generated: {r.meta.refreshed_at.strftime("%Y-%m-%d %H:%M UTC")} | Confidence: {r.meta.confidence.overall} | Schema v{r.meta.schema_version}*
@@ -412,12 +296,12 @@ class AccountResearchPipeline:
 
 ---
 
-## Stakeholder map{stakeholder_note}
+## Stakeholder map
 {stakeholder_lines or "  None identified"}
 
 ---
 
-## Economics (FY{ec.fiscal_year or "N/A"}) — {ec.data_quality}
+## Economics (FY{ec.fiscal_year or "N/A"})
 | Metric | Value |
 |---|---|
 | Revenue | {_fmt_m(ec.revenue_usd_m)} |
@@ -427,7 +311,7 @@ class AccountResearchPipeline:
 | Capex | {_fmt_m(ec.capex_usd_m)} |
 | Data quality | {ec.data_quality} |
 
-### Revenue segments (disclosed)
+### Revenue segments
 {segments or "  Not available"}
 
 ### Semiconductor profile
@@ -437,16 +321,6 @@ class AccountResearchPipeline:
 - **Known chip suppliers:** {", ".join(semi.known_chip_suppliers) or "N/A"}
 - **Supply gaps:** {", ".join(semi.known_supply_gaps) or "N/A"}
 - **Qualification cycle:** {semi.qualification_cycle or "N/A"}
-
-### Segment SAM estimate (Power / EP / HPC / CONN / AMS)
-> ⚠️ **Benchmark-derived estimates, not disclosed figures.** These combine this
-> account's unit volume (where disclosed) with third-party semiconductor-content
-> benchmarks per vertical. Never treat as audited — check the confidence tag
-> on each line.
-
-{sam_lines or "  Not yet computed"}
-
-{("*Benchmark sources: " + "; ".join(sam_sources) + "*") if sam_sources else ""}
 
 ---
 
