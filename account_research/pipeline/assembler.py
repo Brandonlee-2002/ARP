@@ -11,6 +11,7 @@ stakeholders block, we log a warning and continue with an empty list.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -37,6 +38,14 @@ from ..models.schema import (
 from ..extractors.edgar import EdgarFinancials
 
 logger = logging.getLogger(__name__)
+
+# Marker substring of the role-title placeholder T-019's grounding pass
+# (llm_enricher._ground_stakeholders) writes over an ungrounded LLM name,
+# e.g. "Chief Nothing (name not found)". Such a placeholder must never be
+# treated as a match against a programmatic contact — doing so would stamp
+# verified=True on a name the model invented, the opposite of what the flag
+# means (see CLAUDE.md's "Grounding rules are deliberate" section).
+PLACEHOLDER_NAME_MARKER = "(name not found)"
 
 
 class RecordAssembler:
@@ -87,10 +96,13 @@ class RecordAssembler:
 
         # ------------------------------------------------------------------
         # Stakeholders — merge LLM-found (web search) with programmatic
-        # (Apollo/PDL) sources before validation. LLM entries win on
-        # conflict since they usually carry buying-relevance notes drawn
-        # from actual context; programmatic contacts fill out the roster
-        # with people (mainly engineers) who never showed up in a web search.
+        # (Apollo/PDL) sources before validation. An LLM stakeholder whose
+        # name matches a programmatic contact (exact, then surname,
+        # case-insensitive) is stamped verified=True and has its
+        # title/linkedin_url/email/location overridden from the structured
+        # contact; its role_type/notes/influence_score stay the LLM's own.
+        # A programmatic contact nobody in the LLM list matched is still
+        # added as its own verified=True stakeholder rather than dropped.
         # ------------------------------------------------------------------
         raw_stakeholders = self._merge_stakeholder_sources(
             enriched.get("stakeholders", []) or [],
@@ -168,20 +180,90 @@ class RecordAssembler:
                 logger.debug("[assembler] location skipped: %s — %s", item, exc)
         return locations
 
-    def _merge_stakeholder_sources(self, llm_list: list[dict], programmatic_list: list[dict]) -> list[dict]:
-        def key(s: dict) -> str:
-            return (s.get("name") or "").strip().lower()
+    @staticmethod
+    def _normalize_name(name: Optional[str]) -> str:
+        # Strip punctuation (so "(name not found)" doesn't leave a stray
+        # "found)" token) before collapsing whitespace and lowercasing.
+        cleaned = re.sub(r"[^\w\s'-]", " ", (name or "").lower())
+        return re.sub(r"\s+", " ", cleaned).strip()
 
-        merged: dict[str, dict] = {}
-        for s in llm_list:
-            k = key(s)
-            if k:
-                merged[k] = s
-        for s in programmatic_list:
-            k = key(s)
-            if k and k not in merged:   # LLM version wins if the same person shows up in both
-                merged[k] = s
-        return list(merged.values())
+    @staticmethod
+    def _surname(normalized_name: str) -> str:
+        parts = normalized_name.split()
+        return parts[-1] if parts else ""
+
+    def _find_programmatic_match(
+        self, name: Optional[str], programmatic_list: list[dict]
+    ) -> Optional[dict]:
+        """
+        Find the programmatic (Apollo/PDL) contact matching `name`: exact
+        normalized-name match first, then a surname-only fallback, both
+        case-insensitive. A T-019 grounding placeholder (e.g. "Chief
+        Nothing (name not found)") never matches anything — checked against
+        the raw name before punctuation stripping, since PLACEHOLDER_NAME_
+        MARKER itself contains parentheses. This guard is load-bearing: the
+        placeholder's last word before the closing paren ("found") could
+        otherwise collide with a real contact's surname under the
+        punctuation-stripped surname fallback. Stamping verified=True on an
+        LLM-invented name would be exactly the false signal `verified`
+        exists to prevent.
+        """
+        if PLACEHOLDER_NAME_MARKER in (name or "").strip().lower():
+            return None
+
+        normalized = self._normalize_name(name)
+        if not normalized:
+            return None
+
+        for contact in programmatic_list:
+            if self._normalize_name(contact.get("name")) == normalized:
+                return contact
+
+        surname = self._surname(normalized)
+        if not surname:
+            return None
+        for contact in programmatic_list:
+            contact_normalized = self._normalize_name(contact.get("name"))
+            if contact_normalized and self._surname(contact_normalized) == surname:
+                return contact
+        return None
+
+    def _merge_stakeholder_sources(self, llm_list: list[dict], programmatic_list: list[dict]) -> list[dict]:
+        """
+        Match each LLM-derived stakeholder against `programmatic_list` by
+        normalized name (see `_find_programmatic_match`). A match sets
+        verified=True and overrides title/linkedin_url/email/location from
+        the structured contact — the contact is the current-employment
+        signal `verified` represents, so it wins on those fields; the LLM
+        keeps role_type/notes/influence_score, which the contact search
+        alone can't judge. Programmatic contacts nobody in the LLM list
+        matched are still appended as their own verified=True stakeholders
+        (the safety net the original design had) rather than dropped.
+        """
+        merged: list[dict] = []
+        matched_contact_ids: set[int] = set()
+
+        for item in llm_list:
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            match = self._find_programmatic_match(item.get("name"), programmatic_list)
+            if match is not None:
+                item["verified"] = True
+                for field in ("title", "linkedin_url", "email", "location"):
+                    if match.get(field) is not None:
+                        item[field] = match[field]
+                matched_contact_ids.add(id(match))
+            merged.append(item)
+
+        for contact in programmatic_list:
+            if id(contact) in matched_contact_ids:
+                continue
+            new_stakeholder = dict(contact)
+            new_stakeholder["verified"] = True
+            merged.append(new_stakeholder)
+
+        return merged
 
     def _build_stakeholders(self, raw: list, max_stakeholders: int = 25) -> list[Stakeholder]:
         stakeholders = []
@@ -214,12 +296,30 @@ class RecordAssembler:
             fin_raw["capex_usd_m"]             = _to_m(edgar.capex_usd) or fin_raw.get("capex_usd_m")
             fin_raw["fiscal_year"]             = edgar.fiscal_year or fin_raw.get("fiscal_year")
 
-            if edgar.fx_rate_to_usd is not None:
+            # T-018 split conversion into two independent rates: the
+            # period-average rate for flow items (revenue, net income, R&D,
+            # capex) and the period-end closing rate for total assets.
+            # Either can be None on its own — name only the rate(s) that
+            # actually exist, and say which figures each one produced, so a
+            # reader can recover the original figure from the right rate.
+            if edgar.fx_rate_avg_to_usd is not None or edgar.fx_rate_to_usd is not None:
                 fin_raw["data_quality"] = "estimated"
-                fin_raw["notes"] = (
-                    f"Converted from {edgar.reporting_currency} at {edgar.fx_rate_to_usd} "
-                    f"({edgar.fx_rate_date}, source: {edgar.fx_rate_source})"
-                )
+                sentences = []
+                if edgar.fx_rate_avg_to_usd is not None:
+                    sentences.append(
+                        f"Revenue, net income, R&D and capex converted from "
+                        f"{edgar.reporting_currency} at the period-average rate "
+                        f"{edgar.fx_rate_avg_to_usd} "
+                        f"({edgar.fx_rate_avg_start}..{edgar.fx_rate_avg_end}, "
+                        f"source: {edgar.fx_rate_avg_source})"
+                    )
+                if edgar.fx_rate_to_usd is not None:
+                    sentences.append(
+                        f"Total assets converted from {edgar.reporting_currency} "
+                        f"at the period-end closing rate {edgar.fx_rate_to_usd} "
+                        f"({edgar.fx_rate_date}, source: {edgar.fx_rate_source})"
+                    )
+                fin_raw["notes"] = ". ".join(sentences) + "."
             else:
                 fin_raw["data_quality"] = "audited"
 
