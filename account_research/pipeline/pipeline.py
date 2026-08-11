@@ -159,6 +159,7 @@ class AccountResearchPipeline:
             domain=domain,
             search_results=search_results,
             edgar_data=edgar_data,
+            programmatic_contacts=programmatic_stakeholders,
         )
 
         # ------------------------------------------------------------------

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -22,6 +23,11 @@ import anthropic
 
 from ..extractors.web_search import SearchResult
 from ..extractors.edgar import EdgarFinancials
+from ..extractors.grounding import (
+    is_url_grounded,
+    number_grounded,
+    text_contains_claim,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +54,19 @@ class LLMEnricher:
         domain: str,
         search_results: list[SearchResult],
         edgar_data: Optional[EdgarFinancials] = None,
+        programmatic_contacts: Optional[list[dict]] = None,
     ) -> dict[str, Any]:
         """
         Returns a dict with keys matching AccountResearchRecord sections.
         Each section is independently extracted; failures return {} for
         that section so the rest of the record still populates.
+
+        `programmatic_contacts` is the Apollo/PDL contact list (stage 2b
+        of the pipeline, Stakeholder-shaped dicts from
+        `people_data._to_stakeholder_dict()`). It is a grounding source in
+        its own right: a real contact the LLM correctly surfaced has no
+        web-snippet backing, and checking snippets alone would get it
+        discarded as "ungrounded".
         """
         # Group search snippets by topic for targeted prompts
         by_topic = self._group_by_topic(search_results)
@@ -63,12 +77,27 @@ class LLMEnricher:
 
         sections["overview"]      = self._extract_overview(company_name, domain, by_topic)
         sections["locations"]     = self._extract_locations(company_name, by_topic)
-        sections["stakeholders"]  = self._extract_stakeholders(company_name, by_topic)
-        sections["economics"]     = self._extract_economics(company_name, by_topic, edgar_data)
+
+        stakeholders = self._extract_stakeholders(company_name, by_topic)
+        sections["stakeholders"] = self._ground_stakeholders(
+            stakeholders,
+            by_topic.get("stakeholders", ""),
+            programmatic_contacts or [],
+        )
+
+        economics = self._extract_economics(company_name, by_topic, edgar_data)
+        econ_source_text = "\n".join(
+            [by_topic.get("financials", ""), by_topic.get("semi_profile", "")]
+        )
+        sections["economics"] = self._ground_economics(economics, econ_source_text, edgar_data)
+
         sections["account_intelligence"] = self._extract_account_intelligence(
             company_name, raw_text_all
         )
-        sections["news"]          = self._extract_news(company_name, by_topic)
+
+        news_items = self._extract_news(company_name, by_topic)
+        news_results = [r for r in search_results if r.topic == "news"]
+        sections["news"] = self._ground_news(news_items, news_results)
 
         return sections
 
@@ -298,6 +327,139 @@ fab investments, chip sourcing, earnings, leadership changes, partnerships.
 """
         result = self._call(prompt, section="news", expect_list=True)
         return result if isinstance(result, list) else []
+
+    # ------------------------------------------------------------------
+    # Grounding — catches invented names, figures, and URLs that are
+    # schema-valid but never actually appeared in retrieved text. See
+    # ../extractors/grounding.py for the underlying checks; this is just
+    # the wiring: which value gets checked against which source, and
+    # what happens on failure (placeholder, drop, or null — never a
+    # silent keep).
+    # ------------------------------------------------------------------
+
+    # Financials fields the LLM prompt explicitly hands EDGAR's audited
+    # numbers for (see the `edgar_block` in `_extract_economics`). Those
+    # numbers legitimately won't appear in the web-search source text, and
+    # get overridden again by the audited EDGAR figures later in
+    # `assembler._build_economics` — so they must never be nulled here.
+    _EDGAR_SOURCED_FINANCIAL_FIELDS = frozenset({
+        "revenue_usd_m", "net_income_usd_m", "rd_spend_usd_m",
+        "capex_usd_m", "gross_margin_pct",
+    })
+
+    # All numeric financials fields eligible for grounding (superset of
+    # the EDGAR-sourced ones above).
+    _ECONOMICS_NUMERIC_FIELDS = (
+        "revenue_usd_m", "revenue_growth_pct", "gross_margin_pct",
+        "operating_margin_pct", "net_income_usd_m", "rd_spend_usd_m",
+        "rd_pct_revenue", "capex_usd_m", "market_cap_usd_m",
+    )
+
+    @staticmethod
+    def _normalize_name(name: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+    def _ground_stakeholders(
+        self,
+        stakeholders: list,
+        source_text: str,
+        programmatic_contacts: list[dict],
+    ) -> list[dict]:
+        """
+        A stakeholder name is grounded if it appears in the stakeholder
+        snippets OR matches a programmatic (Apollo/PDL) contact name —
+        the contact list counts as a grounding source in its own right so
+        a real contact never gets destroyed for lacking snippet backing.
+        Ungrounded names are replaced with a role-title placeholder, never
+        dropped — the stakeholder (title, role_type, notes) still holds
+        useful signal even if the name doesn't check out.
+        """
+        contact_names = {
+            self._normalize_name(c.get("name"))
+            for c in programmatic_contacts
+            if isinstance(c, dict) and c.get("name")
+        }
+
+        grounded: list[dict] = []
+        for item in stakeholders:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or ""
+            if self._normalize_name(name) in contact_names or text_contains_claim(name, source_text):
+                grounded.append(item)
+                continue
+
+            item = dict(item)
+            title = item.get("title") or "Stakeholder"
+            item["name"] = f"{title} (name not found)"
+            logger.info(
+                "[grounding] stakeholder name %r ungrounded — replaced with placeholder %r",
+                name, item["name"],
+            )
+            grounded.append(item)
+        return grounded
+
+    def _ground_news(
+        self,
+        news_items: list,
+        news_results: list[SearchResult],
+    ) -> list[dict]:
+        """
+        A news item's URL is grounded only if it matches a URL actually
+        returned by that run's news-topic search results. Ungrounded
+        items are dropped outright — an invented citation has no salvage
+        value the way an invented name does.
+        """
+        known_urls = {r.url for r in news_results if r.url}
+
+        kept: list[dict] = []
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url") or ""
+            if is_url_grounded(url, known_urls):
+                kept.append(item)
+            else:
+                logger.info(
+                    "[grounding] news item dropped — url not returned by search: %r (%r)",
+                    item.get("headline"), url,
+                )
+        return kept
+
+    def _ground_economics(
+        self,
+        economics: Any,
+        source_text: str,
+        edgar: Optional[EdgarFinancials],
+    ) -> Any:
+        """
+        Nulls any economics.financials numeric figure that doesn't appear
+        in the economics-topic source text — except the fields the model
+        was explicitly handed EDGAR's audited numbers for, which are
+        exempt whenever EDGAR data was available for this run (see
+        `_EDGAR_SOURCED_FINANCIAL_FIELDS`).
+        """
+        if not isinstance(economics, dict):
+            return economics
+        financials = economics.get("financials")
+        if not isinstance(financials, dict):
+            return economics
+
+        for field_name in self._ECONOMICS_NUMERIC_FIELDS:
+            if edgar is not None and field_name in self._EDGAR_SOURCED_FINANCIAL_FIELDS:
+                continue
+            value = financials.get(field_name)
+            if value is None:
+                continue
+            if not number_grounded(value, source_text):
+                logger.info(
+                    "[grounding] economics.financials.%s=%s ungrounded — set to null",
+                    field_name, value,
+                )
+                financials[field_name] = None
+
+        economics["financials"] = financials
+        return economics
 
     # ------------------------------------------------------------------
     # LLM call wrapper
