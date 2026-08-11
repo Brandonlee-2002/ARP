@@ -1,0 +1,47 @@
+name: tests
+
+# Runs on every push and pull request. Only the offline suite runs here:
+# `-m "not network"` deselects the tests that call SEC EDGAR and the ECB rate
+# service, so CI needs no API keys and never depends on a third party being up.
+# Run the network-marked tests locally with a bare `python -m pytest`.
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Don't cancel 3.13 just because 3.14 fails (or vice versa) — knowing it's
+      # version-specific is the useful signal.
+      fail-fast: false
+      matrix:
+        # Local development runs 3.14.5; 3.13 is included so a failure that is
+        # specific to one interpreter is immediately distinguishable from a real
+        # regression.
+        python-version: ["3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Package imports
+        # The project's stated minimum bar for any change under account_research/:
+        # a broken relative import or a pipeline/assembler signature mismatch
+        # fails here and nowhere else.
+        run: python -c "from account_research import AccountResearchPipeline; print('ok')"
+
+      - name: Offline test suite
+        run: python -m pytest -m "not network" -q
