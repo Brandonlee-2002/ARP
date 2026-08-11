@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 
 EDGAR_BASE = "https://data.sec.gov"
 
+# The ticker-to-CIK map is served from www.sec.gov, not data.sec.gov — only
+# the submissions/ and api/xbrl/ endpoints live on data.sec.gov. Confirmed
+# live: data.sec.gov/files/company_tickers.json -> 404,
+# www.sec.gov/files/company_tickers.json -> 200. See docs/NOTES.md.
+SEC_WWW_BASE = "https://www.sec.gov"
+
+# ECB reference rates via the Frankfurter API (api.frankfurter.dev) — no API
+# key needed, and it supports historical dates, which a period-end FX
+# conversion needs. ECB publishes reference rates for ~30 currencies; a
+# currency it doesn't cover (e.g. TWD) 404s and is treated as unconvertible
+# rather than guessed at. See docs/NOTES.md "Network and TLS gotchas".
+FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
+
 # EDGAR requires a real name and contact email in the User-Agent header
 # as part of their fair-use policy: https://www.sec.gov/developer
 # Replace the values below with your own before running.
@@ -50,6 +63,14 @@ class EdgarFinancials:
     capex_usd:            Optional[float] = None
     total_assets_usd:     Optional[float] = None
     data_quality:         str             = "audited"
+    # Populated only when the filer reports outside USD and a conversion
+    # was actually performed (or attempted) — see _extract_financials and
+    # _fetch_fx_rate. All four stay None on the USD path, unchanged from
+    # pre-T-008 behavior.
+    reporting_currency:   Optional[str]   = None
+    fx_rate_to_usd:       Optional[float] = None
+    fx_rate_date:         Optional[str]   = None
+    fx_rate_source:       Optional[str]   = None
     # SEC's own structured filer classification — NOT a financial figure,
     # but bundled here since it comes from the same free CIK-based lookup
     # path and there's no other natural home for it. Used to give the
@@ -134,7 +155,7 @@ class EdgarExtractor:
         Returns zero-padded 10-digit CIK string.
         """
         time.sleep(0.1)   # stay under 10 req/s
-        resp = self._client.get(f"{EDGAR_BASE}/files/company_tickers.json")
+        resp = self._client.get(f"{SEC_WWW_BASE}/files/company_tickers.json")
         resp.raise_for_status()
         data = resp.json()
 
@@ -193,63 +214,178 @@ class EdgarExtractor:
         # Prefer US GAAP; fall back to IFRS
         concepts = us_gaap if us_gaap else ifrs
 
-        result.revenue_usd          = self._latest_annual(concepts, [
+        # The revenue lookup also tells us the fiscal period, the filing
+        # metadata, and — since T-008 — the currency the filer reports in
+        # (USD, or whatever single foreign-currency unit key is present).
+        revenue_result = self._latest_annual_entry(concepts, [
             "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
             "SalesRevenueNet", "RevenueFromSaleOfGoods",
         ])
-        result.gross_profit_usd     = self._latest_annual(concepts, ["GrossProfit"])
-        result.operating_income_usd = self._latest_annual(concepts, [
-            "OperatingIncomeLoss", "ProfitLossFromOperatingActivities",
-        ])
-        result.net_income_usd       = self._latest_annual(concepts, [
-            "NetIncomeLoss", "ProfitLoss",
-        ])
-        result.rd_expense_usd       = self._latest_annual(concepts, [
-            "ResearchAndDevelopmentExpense",
-            "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
-        ])
-        result.capex_usd            = self._latest_annual(concepts, [
-            "PaymentsToAcquirePropertyPlantAndEquipment",
-            "PurchaseOfPropertyPlantAndEquipment",
-        ])
-        result.total_assets_usd     = self._latest_annual(concepts, ["Assets"])
 
-        # Infer fiscal year from the revenue filing date
-        revenue_entry = self._latest_annual_entry(concepts, [
-            "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-        ])
-        if revenue_entry:
+        # Raw figures, in whatever currency `revenue_result` was reported in
+        # (not yet converted to USD).
+        raw_revenue          = None
+        currency              = "USD"
+        if revenue_result:
+            revenue_entry, currency = revenue_result
+            raw_revenue = float(revenue_entry["val"])
             result.fiscal_year = int(revenue_entry.get("end", "0000")[:4])
             result.filed_date  = revenue_entry.get("filed")
             result.form_type   = revenue_entry.get("form")
 
+        raw_gross_profit     = self._latest_annual(concepts, ["GrossProfit"])
+        raw_operating_income = self._latest_annual(concepts, [
+            "OperatingIncomeLoss", "ProfitLossFromOperatingActivities",
+        ])
+        raw_net_income       = self._latest_annual(concepts, [
+            "NetIncomeLoss", "ProfitLoss",
+        ])
+        raw_rd_expense       = self._latest_annual(concepts, [
+            "ResearchAndDevelopmentExpense",
+            "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+        ])
+        raw_capex            = self._latest_annual(concepts, [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PurchaseOfPropertyPlantAndEquipment",
+        ])
+        raw_total_assets     = self._latest_annual(concepts, ["Assets"])
+
+        if currency == "USD":
+            # Unchanged from pre-T-008 behavior: no conversion, no FX fields.
+            result.revenue_usd          = raw_revenue
+            result.gross_profit_usd     = raw_gross_profit
+            result.operating_income_usd = raw_operating_income
+            result.net_income_usd       = raw_net_income
+            result.rd_expense_usd       = raw_rd_expense
+            result.capex_usd            = raw_capex
+            result.total_assets_usd     = raw_total_assets
+            return result
+
+        # Foreign filer reporting outside USD (e.g. ASML in EUR). Populate
+        # what we know for certain regardless of whether FX conversion
+        # succeeds, so the record is never empty just because conversion
+        # failed.
+        result.reporting_currency = currency
+        if not revenue_result:
+            return result
+
+        period_end = revenue_entry.get("end")
+        rate = self._fetch_fx_rate(currency, period_end)
+        if not rate:
+            logger.warning(
+                "[edgar] No USD conversion rate available for %s as of %s "
+                "— leaving *_usd fields None for %s",
+                currency, period_end, ticker,
+            )
+            return result
+
+        rate_value, rate_date = rate
+        result.fx_rate_to_usd = rate_value
+        result.fx_rate_date   = rate_date
+        result.fx_rate_source = (
+            f"ECB reference rate via Frankfurter (api.frankfurter.dev), {rate_date}"
+        )
+
+        def _to_usd(raw_value: Optional[float]) -> Optional[float]:
+            return raw_value * rate_value if raw_value is not None else None
+
+        result.revenue_usd          = _to_usd(raw_revenue)
+        result.gross_profit_usd     = _to_usd(raw_gross_profit)
+        result.operating_income_usd = _to_usd(raw_operating_income)
+        result.net_income_usd       = _to_usd(raw_net_income)
+        result.rd_expense_usd       = _to_usd(raw_rd_expense)
+        result.capex_usd            = _to_usd(raw_capex)
+        result.total_assets_usd     = _to_usd(raw_total_assets)
+
         return result
 
     def _latest_annual(self, concepts: dict, keys: list[str]) -> Optional[float]:
-        entry = self._latest_annual_entry(concepts, keys)
-        return float(entry["val"]) if entry else None
+        result = self._latest_annual_entry(concepts, keys)
+        return float(result[0]["val"]) if result else None
 
-    def _latest_annual_entry(self, concepts: dict, keys: list[str]) -> Optional[dict]:
+    def _latest_annual_entry(
+        self, concepts: dict, keys: list[str]
+    ) -> Optional[tuple[dict, str]]:
         """
-        Finds the most recent annual (10-K or 20-F) filing entry
-        for any of the given XBRL concept keys.
+        Finds the most recent annual (10-K or 20-F) filing entry for any of
+        the given XBRL concept keys, and the currency it was reported in.
+
+        A single 10-K's XBRL facts include comparative prior-year periods
+        that all share the same `filed` date, so sorting by `filed` alone
+        is not enough — Python's stable sort then keeps the original
+        (oldest-first) array order and returns the stalest period. Sort by
+        reporting PERIOD (`end`) descending first, with `filed` descending
+        as the tiebreaker so a period restated in a later filing still
+        prefers the newer filing.
+
+        Currency selection (T-008): prefers `units["USD"]`. When a concept
+        has no USD unit — a foreign private issuer reporting only in its
+        home currency, e.g. ASML in EUR or TSMC in TWD — falls back to
+        whichever single non-USD unit key is present and reports that
+        currency code back to the caller. A concept reporting in more than
+        one non-USD currency (rare, ambiguous) is skipped rather than
+        guessed at.
         """
         for key in keys:
             concept = concepts.get(key, {})
             units = concept.get("units", {})
-            usd_entries = units.get("USD", [])
 
-            # Filter to annual filings only (form 10-K or 20-F)
+            if "USD" in units:
+                currency, entries = "USD", units["USD"]
+            else:
+                non_usd = {k: v for k, v in units.items() if v}
+                if len(non_usd) != 1:
+                    continue
+                currency, entries = next(iter(non_usd.items()))
+
+            # Filter to annual filings only (form 10-K or 20-F). Require a
+            # non-empty `end` too, so a malformed entry can't reach the sort.
             annual = [
-                e for e in usd_entries
+                e for e in entries
                 if e.get("form") in ("10-K", "20-F")
                 and e.get("filed")
+                and e.get("end")
             ]
             if annual:
-                # Most recently filed
-                annual.sort(key=lambda e: e["filed"], reverse=True)
-                return annual[0]
+                annual.sort(key=lambda e: (e["end"], e["filed"]), reverse=True)
+                return annual[0], currency
         return None
+
+    def _fetch_fx_rate(
+        self, currency: str, period_end: Optional[str]
+    ) -> Optional[tuple[float, str]]:
+        """
+        Historical ECB reference rate converting `currency` -> USD, as of
+        (at/nearest before) `period_end`, via Frankfurter. Frankfurter snaps
+        a weekend/holiday date to the previous business day and reports the
+        date it actually used in the response body — return that date, not
+        the one requested, so callers record the rate actually applied.
+
+        Returns None — never a guessed or hardcoded rate — if `period_end`
+        is missing, the currency isn't one of ECB's ~30 reference
+        currencies (e.g. TWD), or the request fails for any reason.
+        """
+        if not period_end:
+            return None
+        try:
+            resp = self._client.get(
+                f"{FRANKFURTER_BASE}/{period_end}",
+                params={"base": currency, "symbols": "USD"},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rate = data.get("rates", {}).get("USD")
+            rate_date = data.get("date")
+            if rate is None or not rate_date:
+                return None
+            return float(rate), rate_date
+        except Exception as exc:
+            logger.warning(
+                "[edgar] FX lookup failed for %s -> USD as of %s: %s",
+                currency, period_end, exc,
+            )
+            return None
 
     def close(self) -> None:
         self._client.close()
