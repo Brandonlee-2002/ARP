@@ -1,16 +1,29 @@
 """
-Pydantic models for the account research schema v1.2.0.
+Pydantic models for the account research schema v1.4.0.
 Each model maps 1:1 to the JSON schema defined in the design phase.
 
-v1.2.0 adds: Segment, BenchmarkConfidence, SegmentSAMEstimate, and the
+v1.4.0 — BREAKING CHANGE: Segment enum reduced from 5 to 4 values. CONN
+(connectivity) is removed; any prior record with segment="conn" will fail
+validation against this schema. This corrects a taxonomy this project
+invented that didn't match Renesas's own canonical product grouping —
+connectivity (BLE, low-power Wi-Fi, NFC) is one family WITHIN AMS
+("Analog & Connectivity"), not a fifth top-level group. Existing benchmark
+segment_split percentages that previously had a separate "conn" share have
+been folded into "ams" (see extractors/segment_benchmarks.py's BENCHMARKS
+table for the redistributed percentages, which were re-verified to still
+sum to 1.0 per vertical after the merge).
+
+v1.2.0 added: Segment, BenchmarkConfidence, SegmentSAMEstimate, and the
 economics.segment_sam_estimates field — benchmark-derived Power / EP / HPC /
-CONN / AMS semiconductor SAM estimates for the target account. These are
-always distinct from audited financials: never set benchmark_confidence to
-anything implying "audited", and never omit the source/rationale fields.
+AMS semiconductor SAM estimates for the target account (originally Power /
+EP / HPC / CONN / AMS — see the v1.4.0 note above for why CONN was removed).
+These are always distinct from audited financials: never set
+benchmark_confidence to anything implying "audited", and never omit the
+source/rationale fields.
 
 (v1.1.0 added the `verified` field on Stakeholder — People Data Labs
-integration. This file merges both lines of work; see the pipeline README's
-changelog for the full history.)
+integration. This file merges multiple lines of work; see the pipeline
+README's changelog for the full history.)
 """
 
 from __future__ import annotations
@@ -21,6 +34,11 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field, HttpUrl
+
+# Re-export for assembler.py's type hints: EdgarFinancials is defined in
+# extractors/edgar.py (its single source of truth); this just makes it
+# importable from models.schema as well.
+from ..extractors.edgar import EdgarFinancials
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +139,20 @@ class SupplierStatus(str, Enum):
 
 
 class Segment(str, Enum):
-    """The five semiconductor product categories we sell into."""
-    POWER = "power"   # power management, discretes, SiC/GaN, motor drive
-    EP    = "ep"       # embedded processing: MCUs, embedded MPUs
-    HPC   = "hpc"       # high-performance compute: server/AI accelerator silicon
-    CONN  = "conn"     # connectivity: RF, networking, wireless/wired interfaces
-    AMS   = "ams"       # analog & mixed-signal: sensors, converters, signal chain
+    """
+    The four canonical Renesas product groups. Changed from 5 to 4 in
+    schema v1.4.0 — CONN (connectivity) was a taxonomy this project
+    invented and doesn't match reality: Renesas's own canonical grouping
+    treats connectivity (BLE, low-power Wi-Fi, NFC) as one family WITHIN
+    AMS, not a fifth top-level group. Do not reintroduce a separate
+    connectivity segment without first checking against Renesas's actual
+    product-group documentation.
+    """
+    POWER = "power"   # power delivery controllers, intelligent power stages, MOSFETs/SiC, PMICs/battery mgmt
+    EP    = "ep"       # embedded processing: RA/RX/RL78/RZ MCUs/MPUs
+    HPC   = "hpc"       # high-performance computing: RH850, R-Car, custom ASIC/ASSP
+    AMS   = "ams"       # Analog & Connectivity: GreenPAK, sensors, custom mixed-signal, timing,
+                        # connectivity (BLE/Wi-Fi/NFC), memory interface, rad-hard
 
 
 class BenchmarkConfidence(str, Enum):
@@ -161,7 +187,7 @@ class ConfidenceMap(BaseModel):
 
 
 class Meta(BaseModel):
-    schema_version:  str            = "1.2.0"
+    schema_version:  str            = "1.4.0"
     record_id:       str            = Field(default_factory=lambda: str(uuid.uuid4()))
     created_at:      datetime       = Field(default_factory=datetime.utcnow)
     refreshed_at:    datetime       = Field(default_factory=datetime.utcnow)
@@ -265,6 +291,7 @@ class Financials(BaseModel):
     capex_usd_m:            Optional[float]       = None
     market_cap_usd_m:       Optional[float]       = None
     data_quality:           DataQuality           = DataQuality.ESTIMATED
+    notes:                  Optional[str]         = None
 
 
 class RevenueSegment(BaseModel):
