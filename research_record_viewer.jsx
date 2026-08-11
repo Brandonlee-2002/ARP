@@ -39,7 +39,7 @@ import { useState, useEffect } from "react";
  *       known_chip_suppliers, known_supply_gaps, qualification_cycle },
  *     // NEW — benchmark-derived estimate, distinct from audited financials:
  *     segment_sam_estimates: [{
- *       segment,                 // "power" | "ep" | "hpc" | "conn" | "ams"
+ *       segment,                 // "power" | "ep" | "hpc" | "ams"
  *       estimated_sam_low_usd_m, estimated_sam_high_usd_m,
  *       unit_basis,               // e.g. "per vehicle produced"
  *       benchmark_source,         // e.g. "AlixPartners (2026)"
@@ -62,10 +62,9 @@ const SEGMENT_LABELS = {
   power: "Power",
   ep:    "Embedded Processing",
   hpc:   "High-Performance Compute",
-  conn:  "Connectivity",
   ams:   "Analog & Mixed-Signal",
 };
-const SEGMENT_ORDER = ["power", "ep", "hpc", "conn", "ams"];
+const SEGMENT_ORDER = ["power", "ep", "hpc", "ams"];
 
 const TABS = [
   { key: "overview",     label: "Overview",      icon: "ti-info-circle" },
@@ -299,8 +298,7 @@ function sampleRecord() {
         { segment: "power", estimated_sam_low_usd_m: 180, estimated_sam_high_usd_m: 300, unit_basis: "per vehicle produced × 40% segment allocation", benchmark_source: "AlixPartners (2026)", benchmark_confidence: "sourced", rationale: "EV traction inverter + OBC + BMS content, applied to ~375k annual unit volume." },
         { segment: "ep", estimated_sam_low_usd_m: 90, estimated_sam_high_usd_m: 150, unit_basis: "per vehicle produced × 20% segment allocation", benchmark_source: "AlixPartners (2026)", benchmark_confidence: "sourced", rationale: "Body/zonal MCUs." },
         { segment: "hpc", estimated_sam_low_usd_m: 45, estimated_sam_high_usd_m: 75, unit_basis: "per vehicle produced × 10% segment allocation", benchmark_source: "AlixPartners (2026)", benchmark_confidence: "sourced", rationale: "ADAS/zonal compute." },
-        { segment: "conn", estimated_sam_low_usd_m: 67, estimated_sam_high_usd_m: 113, unit_basis: "per vehicle produced × 15% segment allocation", benchmark_source: "AlixPartners (2026)", benchmark_confidence: "sourced", rationale: "Telematics, V2X, in-cabin networking." },
-        { segment: "ams", estimated_sam_low_usd_m: 67, estimated_sam_high_usd_m: 113, unit_basis: "per vehicle produced × 15% segment allocation", benchmark_source: "AlixPartners (2026)", benchmark_confidence: "sourced", rationale: "Current/voltage sensing, signal chain." },
+        { segment: "ams", estimated_sam_low_usd_m: 67, estimated_sam_high_usd_m: 113, unit_basis: "per vehicle produced × 15% segment allocation", benchmark_source: "AlixPartners (2026)", benchmark_confidence: "sourced", rationale: "Current/voltage sensing, signal chain; also covers telematics, V2X, and in-cabin networking." },
       ],
     },
     account_intelligence: {
@@ -525,29 +523,38 @@ function SegmentSAMSection({ r }) {
         </p>
       </div>
 
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:12}}>
-        {SEGMENT_ORDER.map(seg => {
-          const e = bySegment[seg];
-          return (
-            <div key={seg} style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.1rem",display:"flex",flexDirection:"column",gap:8}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}}>
-                <p style={{fontSize:12,fontWeight:600,color:"var(--text-secondary)",margin:0}}>{SEGMENT_LABELS[seg]}</p>
-                {e ? <ConfBadge label={e.benchmark_confidence}/> : <ConfBadge label="needs_research"/>}
+      {estimates.length === 0 ? (
+        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
+          <p style={{fontSize:12.5,color:"var(--text-muted)",margin:0,lineHeight:1.55}}>
+            No segment SAM estimates on this record — the benchmark-derived SAM stage has
+            been retired from the current pipeline and no longer produces this data.
+          </p>
+        </div>
+      ) : (
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:12}}>
+          {SEGMENT_ORDER.map(seg => {
+            const e = bySegment[seg];
+            return (
+              <div key={seg} style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.1rem",display:"flex",flexDirection:"column",gap:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}}>
+                  <p style={{fontSize:12,fontWeight:600,color:"var(--text-secondary)",margin:0}}>{SEGMENT_LABELS[seg]}</p>
+                  {e ? <ConfBadge label={e.benchmark_confidence}/> : <ConfBadge label="needs_research"/>}
+                </div>
+                {e ? (
+                  <>
+                    <p style={{fontSize:20,fontWeight:600,margin:0}}>{fmtRange(e.estimated_sam_low_usd_m, e.estimated_sam_high_usd_m)}</p>
+                    <p style={{fontSize:11,color:"var(--text-muted)",margin:0}}>{e.unit_basis}</p>
+                    {e.rationale && <p style={{fontSize:12,color:"var(--text-secondary)",margin:"4px 0 0",lineHeight:1.5}}>{e.rationale}</p>}
+                    <p style={{fontSize:10,color:"var(--text-muted)",margin:"6px 0 0",borderTop:"0.5px solid var(--border)",paddingTop:6}}>Source: {e.benchmark_source||"—"}</p>
+                  </>
+                ) : (
+                  <p style={{fontSize:12,color:"var(--text-muted)",margin:0,lineHeight:1.5}}>No benchmark sourced for this segment yet — pipeline hasn't computed an estimate.</p>
+                )}
               </div>
-              {e ? (
-                <>
-                  <p style={{fontSize:20,fontWeight:600,margin:0}}>{fmtRange(e.estimated_sam_low_usd_m, e.estimated_sam_high_usd_m)}</p>
-                  <p style={{fontSize:11,color:"var(--text-muted)",margin:0}}>{e.unit_basis}</p>
-                  {e.rationale && <p style={{fontSize:12,color:"var(--text-secondary)",margin:"4px 0 0",lineHeight:1.5}}>{e.rationale}</p>}
-                  <p style={{fontSize:10,color:"var(--text-muted)",margin:"6px 0 0",borderTop:"0.5px solid var(--border)",paddingTop:6}}>Source: {e.benchmark_source||"—"}</p>
-                </>
-              ) : (
-                <p style={{fontSize:12,color:"var(--text-muted)",margin:0,lineHeight:1.5}}>No benchmark sourced for this segment yet — pipeline hasn't computed an estimate.</p>
-              )}
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
