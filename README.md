@@ -1,6 +1,17 @@
 # Account research pipeline
 
-Automated company research for semiconductor account managers. Given a company name, domain, and optional stock ticker, the pipeline produces a structured JSON record and a human-readable Markdown one-pager covering headquarters, office locations, stakeholder map, financials, semiconductor segment SAM estimates, and account intelligence signals.
+Automated company research for semiconductor account managers. Given a company name, domain, and optional stock ticker, the pipeline produces a structured JSON record and a human-readable Markdown one-pager covering headquarters, office locations, stakeholder map, financials, semiconductor profile, and account intelligence signals.
+
+> **Reading this README (as of v1.4.0).** The pipeline was reduced from seven
+> stages to four. Sections describing the FCC facility lookup, USPTO patent
+> search, benchmark-derived segment SAM estimates, and the grounding pass are kept
+> below **for historical reference** — those modules are still on disk but are no
+> longer wired into any stage, and each such section opens with a callout saying
+> so. Note the distinction: the first three are **retired features**, while
+> [Grounding safeguards](#grounding-safeguards) describes a **safety mechanism
+> that is simply unwired** — a more consequential gap. The changelog is
+> deliberately left intact as a full history, so entries below v1.4.0 describe the
+> pipeline as it was at the time, not as it is now.
 
 **This project ships as two independent, standalone implementations — you only need one, not both:**
 
@@ -19,6 +30,73 @@ There's also a third, smaller artifact — `research_record_viewer.jsx` — whic
 ---
 
 ## Changelog
+
+### v1.4.1 — 2026-08-11
+
+**Added — a test suite, which is the reason the rest of this entry exists**
+
+- `tests/` (pytest, `pytest>=8.0` added to `requirements.txt`) with 48 offline tests plus network-marked live checks, split across `test_edgar.py`, `test_assembler.py`, `test_grounding.py` and `test_schema.py`. Offline tests use fake XBRL/FX payloads and never touch the network; `pytest.ini` registers a `network` marker so the live ones are skippable.
+- It carries a regression test for **every** bug found on 2026-08-10/11 — the stale-comparative-year sort, the ticker-map host, FX marking, unknown-ticker handling, the `EdgarFinancials` re-export identity, and the four-value `Segment` enum. Each of those shipped because nothing mechanical would have caught it. `requirements.txt` also had `anthropic`, `httpx` and `pydantic` listed twice; deduplicated.
+
+**Fixed — `fetch()` no longer hides hard failures behind a WARNING**
+
+- `EdgarExtractor.fetch()` wrapped everything in one blanket `except Exception`, logged a single WARNING, and returned `None` — conflating "this ticker isn't on EDGAR" (benign, a private company) with "our request is broken" (a bug). That is exactly how the `data.sec.gov` 404 stayed invisible while every record silently lost its financials. A genuinely absent ticker now logs at INFO; a hard failure (bad status on the ticker map or companyfacts, JSON/parse error, network error) logs at **ERROR** with the URL. Both still return `None` and never raise, so one company's failure can't take down a batch run. `tests/test_edgar.py` asserts the log level on both branches via `caplog`.
+
+**Fixed — FX conversion now matches accounting practice**
+
+- Income-statement (flow) items — revenue, gross profit, operating income, net income, R&D, capex — convert at the **period-average** ECB rate, computed from Frankfurter's date-range endpoint across the fiscal period. `total_assets_usd`, a balance-sheet item stated as of the period end, keeps the **period-end closing** rate. v1.4.0 used the closing rate for everything, which overstated ASML's FY2025 USD revenue by roughly $1.5B ($38.4B → $36.9B). Both rates are recorded, and each rate's failure nulls only the fields it was responsible for.
+- **The note now names the rate that actually produced each figure.** Splitting the rates initially left the note advertising only the closing rate, so back-calculating ASML's revenue from it gave €31,406M against a true €32,667M — off by ~€1.26B. `tests/test_assembler.py` now carries a round-trip assertion (divide the recorded figure by the rate the note names, recover the filed figure), because that absence is why it slipped through in the first place.
+
+**Fixed — the grounding pass is running again**
+
+- `extractors/grounding.py` was orphaned during the four-stage restructure: imported by nothing, so nothing re-checked that a stakeholder name, figure, or news URL traced back to real retrieved text. Now wired back into `llm_enricher.py`. An ungrounded stakeholder name becomes a role-title placeholder (the stakeholder is kept, not dropped), an ungrounded news URL drops the item, and an ungrounded LLM figure is nulled. Each action logs one INFO line.
+- **Stakeholder names ground against the web snippets *or* the Apollo/PDL contact list.** `enrich()` gained a `programmatic_contacts` parameter for this, threaded from stage 2b. Checking snippets alone would have deleted real verified contacts, who frequently have no web presence — a safety check that silently destroys your best data is worse than none.
+- **EDGAR-sourced figures are exempt from number-grounding.** They come from a filing, not from search text; grounding them against snippets would null a filed figure for not appearing in a blog post.
+
+**Fixed — `Stakeholder.verified` is set again**
+
+- Nothing populated it, so it was always `False` — reading as "this account has no verified contacts" rather than "that signal is off". LLM-extracted stakeholders are now matched against the Apollo/PDL contacts by normalized name (exact, then surname fallback, case-insensitive); a match sets `verified=True` and lets the structured contact override the LLM's title, email, LinkedIn and location. A contact the LLM never surfaced is still added rather than dropped.
+- A grounding placeholder such as `"VP of Procurement (name not found)"` can **never** match a contact — otherwise `verified=True` would be stamped on a name the model invented, inverting the flag's meaning. The check happens before name normalization, since normalization strips the parentheses and the remaining token can collide with a real surname.
+
+**Fixed — the viewer's dead segment-SAM state**
+
+- `research_record_viewer.jsx`'s sample fixture still contained a `segment: "conn"` entry that the four-value `Segment` enum rejects; removed, with its rationale folded into the `ams` entry. `SEGMENT_LABELS` and `SEGMENT_ORDER` dropped their `conn` keys. When `segment_sam_estimates` is empty — which it now always is — the section renders an explicit note saying the stage was retired, instead of a grid of blank placeholders.
+- `src/app.jsx` needed no change: it never had the segment-SAM feature in any committed revision.
+
+### v1.4.0 — 2026-08-11
+
+**Changed — pipeline reduced from seven stages to four**
+
+- New `extractors/people_data.py` replaces `people_search.py`: contacts come from **Apollo.io + People Data Labs**, configured via `APOLLO_API_KEY` / `PDL_API_KEY`, with per-provider normalization, cross-provider dedup, and title/seniority-based role and influence inference. A missing key for one provider doesn't disable the other.
+- The FCC facility lookup, USPTO patent search, segment SAM estimation, and the grounding pass are **no longer wired into the pipeline**. `fcc_search.py`, `patent_search.py`, `people_search.py`, `segment_benchmarks.py` and `grounding.py` remain on disk but are imported by nothing.
+- Consequences worth knowing: `economics.segment_sam_estimates` now has **no producer** and will be empty; the `Stakeholder.verified` flag is **no longer set** by anything; `FCC_APP_TOKEN` and `USPTO_API_KEY` are no longer read.
+
+**Fixed — three EDGAR bugs, each of which was hiding the next**
+
+- **Ticker-to-CIK lookup 404'd on every call.** `files/company_tickers.json` was requested from `data.sec.gov`, which returns 404 for that path; SEC serves it from `www.sec.gov`. Because `fetch()` turns a hard failure into one WARNING and returns `None`, *every* run silently produced a record with no EDGAR financials and no SIC anchor — making the v1.3.1 SIC work dead code in practice. A separate `SEC_WWW_BASE` constant is now used for that one lookup; `EDGAR_BASE` stays `data.sec.gov` for `submissions/` and `api/xbrl/`, which are correct there.
+- **Financials were two years stale.** A 10-K carries comparative figures for three fiscal years, all sharing one `filed` date. `_latest_annual_entry` sorted by `filed` alone and took the first result — and since Python's sort is stable, equal keys kept array order, returning the *oldest* period in the filing. Intel reported `FY2023 $54.228B` when the correct current figure was `FY2025 $52.853B`. Note the direction: Intel's revenue is declining, so the bug silently **overstated** a target's size. Now sorted by period `end` descending, with `filed` as the tiebreaker so a restated period still prefers the newer filing.
+- **Foreign filers reporting in a non-USD currency returned nothing.** Only `units["USD"]` was ever read, so ASML (which reports revenue in EUR) resolved a CIK and then left every financial field `None`. Now converts via **ECB reference rates** (Frankfurter, no API key, historical dates), fetched for the fiscal period's end date, with `reporting_currency` / `fx_rate_to_usd` / `fx_rate_date` / `fx_rate_source` recorded alongside. ECB covers ~30 currencies and **not TWD**, so a Taiwan-domiciled filer is genuinely unconvertible — in that case the USD fields stay `None` and a WARNING is logged rather than an approximate rate being substituted.
+- **Two rates, matched to the kind of figure.** Income-statement (flow) items — revenue, gross profit, operating income, net income, R&D, capex — convert at the **period-average** ECB rate, computed from Frankfurter's date-range endpoint across the fiscal period. `total_assets_usd`, a balance-sheet item stated as of the period end, converts at the **period-end closing** rate. This follows accounting practice; an earlier revision used the closing rate for everything, which for ASML's FY2025 overstated USD revenue by roughly $1.5B. Both rates are recorded (`fx_rate_to_usd` / `fx_rate_date` for closing, `fx_rate_avg_to_usd` / `fx_rate_avg_start` / `fx_rate_avg_end` for average), and each rate's failure nulls only the fields it was responsible for.
+- **A converted figure is never labelled audited, and the note names the rate that produced it.** `assembler.py` stamps `data_quality = "estimated"` whenever either FX rate is set, and writes a `Financials.notes` string identifying both rates and which figures each one converted — so a reader can divide back out and recover the filed figure. The USD path is unchanged at `"audited"` with no note.
+
+**Fixed — packaging and imports**
+
+- `account_research/__init__.py` was empty (0 bytes), so the documented `from account_research import AccountResearchPipeline` — used by `run_research.py` itself — raised `ImportError`. It now re-exports the orchestrator.
+- `refresh_scheduler.py`'s CLI imported the pipeline via a `sys.path` hack and a bare `from pipeline import ...`, which resolved to the *directory* as a namespace package and failed at startup. Now a package-relative import.
+- `refresh_scheduler.py` built `AccountResearchPipeline.from_env()` before branching on the subcommand, so `list` and `remove` — which only touch the local registry file — required `ANTHROPIC_API_KEY` and `SEARCH_API_KEY` just to start. The pipeline is now constructed only for `run-due` / `run-one`.
+- `models/schema.py` re-exports `EdgarFinancials` for `assembler.py`'s type hints. The dataclass stays defined in `extractors/edgar.py` as its single source of truth.
+
+**Changed — schema (breaking)**
+
+- `Segment` reduced from five values to four: **CONN removed**, folded into AMS. Connectivity (BLE, low-power Wi-Fi, NFC) is one family within "Analog & Connectivity" rather than a fifth top-level group. Any prior record with `segment="conn"` will fail validation. `CPC_SEGMENT_MAP` in `patent_search.py` was remapped to match (`H04B`/`H04W`/`H04L`/`H01Q` → `ams`), and `BENCHMARKS`' per-vertical splits were merged so each still sums to 1.0 — though with segment SAM retired, both now live in orphaned modules.
+- `Financials.notes` added (see the FX note above). `Location.source_confirmations`, briefly added in an unreleased state, was removed again — nothing populated it.
+
+**Verified**
+
+- All EDGAR fixes confirmed against the live SEC API, not by inspection: `INTC` → `cik=0000050863, 10-K, FY2025, $52.853B, sic=3674`; `ASML` → `20-F, EUR, rate 1.175 @ 2025-12-31`; an unknown ticker still returns `None` cleanly without raising.
+- The FX/audited split verified both ways through `RecordAssembler.assemble()`: converted → `estimated` + note naming the rate; USD → `audited` + `notes=None`.
+- `list` / `--help` confirmed to run with `ANTHROPIC_API_KEY` and `SEARCH_API_KEY` explicitly cleared from the environment.
+- Front end still builds clean (`npm run build`, 26 modules).
 
 ### v1.3.1 — 2026-07-23
 
@@ -186,7 +264,7 @@ The more user-friendly of the two options — no terminal, no installation, no A
 - **Re-saving a company you've already researched replaces the old profile** instead of creating a duplicate — matched by domain, not by the internal record ID (which is always freshly generated per run).
 - **Download report** — generates a standalone HTML file and triggers a real browser download (not a same-tab open, which sandboxed artifacts can't do) with a filesystem-safe name derived from company + date; open it and use your browser's Ctrl+P → Save as PDF to get an actual PDF.
 
-Note: `app.jsx` does not currently have a segment SAM tab, the grounding checks, or the `verified` stakeholder flag added on the Python side — those exist in the Python pipeline and in `research_record_viewer.jsx`, not here. `app.jsx` remains fully independent, by design, so this isn't a gap to close so much as a scope boundary to be aware of.
+Note: `app.jsx` does not have a segment SAM tab, the grounding checks, or the `verified` stakeholder flag. Segment SAM is retired on the Python side too, so that one is no longer a gap — but grounding and `verified` are both active in the Python pipeline as of v1.4.1, so records produced there carry provenance signals `app.jsx` neither produces nor displays. `app.jsx` remains fully independent by design, so this is a scope boundary rather than a bug — but don't assume a record from the browser path has been source-checked the way a Python-produced one has.
 
 ### Recent fixes
 
@@ -211,7 +289,9 @@ A separate, smaller React artifact — not an alternative to `app.jsx`, and not 
 
 It exists because the Python pipeline is the only place that can reach SEC EDGAR at all — `data.sec.gov` doesn't support CORS and requires a `User-Agent` header browsers refuse to let JavaScript set, so no browser-based artifact (including `app.jsx`) can ever fetch audited EDGAR data directly. This viewer is the "read the Python pipeline's output" half of that split.
 
-Its one feature beyond what `app.jsx` shows is a dedicated **Segment SAM tab**, plus a persistent provenance bar (audited/sourced vs. estimated vs. needs-research, color-coded) so a benchmark-derived segment estimate can never be visually mistaken for the audited financials sitting next to it. It does not yet surface the `verified` stakeholder flag — a reasonable next addition, not yet built. See the comment header in that file for the exact JSON contract it expects.
+Its one feature beyond what `app.jsx` shows is a dedicated **Segment SAM tab**, plus a persistent provenance bar (audited/sourced vs. estimated vs. needs-research, color-coded) so a benchmark-derived segment estimate can never be visually mistaken for the audited financials sitting next to it. See the comment header in that file for the exact JSON contract it expects.
+
+Two v1.4.0 caveats: the Segment SAM tab will render empty for newly produced records, since nothing populates `segment_sam_estimates` any more; and the viewer's sample fixture still contains a `segment: "conn"` entry, which the current `Segment` enum no longer accepts. The provenance bar is, if anything, more useful than before — it's now the clearest place to spot an FX-converted `estimated` figure sitting beside genuinely audited ones.
 
 ---
 
@@ -219,40 +299,24 @@ Its one feature beyond what `app.jsx` shows is a dedicated **Segment SAM tab**, 
 
 The more technical of the two options — runs from a terminal, needs your own API keys, and writes output to disk. Good fit if you're comfortable with the command line and want scripting/batch-run flexibility.
 
-```
-Web search (14 queries)
-        │
-        ├──► LLM extraction ──► Grounding checks ──► Pydantic validation ──► AccountResearchRecord
-        │    (6 sections +          (extractors/                                     │
-        │    segment SAM            grounding.py)                                    │
-        │    classification,             ▲                                           │
-        │    PDL- and patent-            │                                           │
-        │    anchored)                   │                                           │
-SEC EDGAR ──────────────────────────────┤──────────────────────────►   JSON + Markdown summary
-(audited financials)                    │                          ▲
-                                         │                          │
-People Data Labs ─────────────────────────┤ (verified contacts,     │
-(optional — PDL_API_KEY)                  │  matched by name)       │
-                                           │                         │
-FCC grantee registrations ─────────────────┤ (facility corroboration │
-(always runs, no key needed)               │  by city match)         │
-                                            │                         │
-USPTO Open Data Portal ──────────────────────┤ (inventor corroboration +
-(optional — USPTO_API_KEY)                   │  deterministic segment-
-                                              │  activity signal)
-Segment benchmarks (segment_benchmarks.py) ──┘
-(pure Python SAM math — no LLM involved)
+```text
+Web search ──────────────────────────────┐
+(Serper / Brave / SerpAPI)               │
+                                         │
+SEC EDGAR ───────────────────────────────┼──► LLM extraction ──► Pydantic ──► AccountResearchRecord
+(audited financials, SIC, FX conversion) │    (6 sections, one    validation           │
+                                         │     focused call each)                      │
+Apollo.io + PDL ─────────────────────────┘                                             ▼
+(optional — APOLLO_API_KEY / PDL_API_KEY)                                JSON + Markdown summary
 ```
 
-Seven stages run in sequence, each independently fault-tolerant:
+Four stages run in sequence, each independently fault-tolerant:
 
-1. **Web search** — fires 14 targeted queries across topics (overview, locations, stakeholders, financials, semiconductor profile, news) using Serper, Brave Search, or SerpAPI.
-2. **SEC EDGAR** — for US-listed companies, fetches audited 10-K / 20-F financials directly from EDGAR's public XBRL API. No API key required.
-3. **People search** *(optional)* — if `PDL_API_KEY` is set, looks up verified decision-maker contacts (name, title, LinkedIn, email) via People Data Labs. Skipped entirely if the key isn't set.
-4. **FCC facility lookup** *(always runs, no key required)* — queries FCC equipment authorization grantee registrations for the target company and merges results into `locations`: a city match with an existing (LLM-derived) location gets a corroborating note; no match gets added as a new, explicitly-caveated `Location` entry. Only surfaces anything for companies with RF/wireless products.
-5. **Patent search** *(optional)* — if `USPTO_API_KEY` is set, looks up granted patents and their named inventors, tagged by CPC classification into the five segments. Treated more conservatively than PDL: a matched inventor only ever corroborates an existing stakeholder with a note (patent count, segments, most recent grant) — it never sets `verified: true` and never adds a new stakeholder record for an unmatched inventor, since a patent proves inventorship at some point in time, not current employment. Segment-level patent-activity counts also feed a deterministic `account_intelligence` signal, computed in plain Python from exact counts rather than summarized by the LLM.
-6. **LLM enrichment** — Claude makes one focused call per schema section, returning JSON. EDGAR numbers override LLM estimates where both exist; verified PDL contacts and known patent inventors are both listed in the stakeholder prompt (with different framing — PDL contacts are presented as confirmed current employees, patent inventors are explicitly flagged as needing corroboration) so Claude prefers real names/titles over inference. A dedicated call also classifies the account's semiconductor end-market vertical and looks for a disclosed unit volume — but never invents one; the actual segment SAM dollar math happens afterward in plain Python (`segment_benchmarks.py`), never inside the LLM call. A grounding pass (`extractors/grounding.py`) then re-checks stakeholder names (against the search snippets, the PDL contact list, *and* the patent inventor list — a name only present in one of those lists is still grounded), the disclosed unit volume, and news URLs, discarding or flagging anything that doesn't trace back to something real.
-7. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output. LLM-extracted stakeholders are matched against PDL contacts by normalized name (exact, then surname fallback); a match sets `verified: true` and lets the structured PDL contact info override anything the LLM inferred. Any verified PDL contact the LLM never surfaced is still added via a safety net rather than dropped — patent inventors deliberately do **not** get this same safety-net treatment (see Stage 5).
+1. **Web search** — fires targeted queries across topics (overview, locations, stakeholders, financials, semiconductor profile, news) using Serper, Brave Search, or SerpAPI.
+2. **SEC EDGAR** — for US-listed companies, fetches audited 10-K / 20-F financials directly from EDGAR's public XBRL API, plus the filer's SIC classification. No API key required. Picks the latest reporting *period* (not merely the latest filing — a 10-K contains three comparative years), and converts a non-USD filer's figures to USD at the period-end ECB reference rate, recording the currency, rate, date and source so a converted figure is never mistaken for a filed one.
+   - **2b. Programmatic contacts** *(optional)* — if `APOLLO_API_KEY` and/or `PDL_API_KEY` is set, pulls structured contact records from Apollo.io and People Data Labs, filtered toward engineering/technical roles, normalizes and dedupes across providers, and infers role type and influence from title/seniority. Web search alone tends to surface only people who've been written about (CEOs, VPs); individual contributors don't appear there. Skipped cleanly if neither key is set.
+3. **LLM enrichment** — Claude makes one focused call per schema section (overview, locations, stakeholders, economics, account intelligence, news), returning JSON. EDGAR numbers override LLM estimates where both exist. Note that `enrich()` receives only the search results and EDGAR data — the programmatic contacts are **not** passed into the stakeholder prompt, they are merged later in stage 4.
+4. **Assemble & validate** — merges all sources into a typed `AccountResearchRecord`, scores confidence per section, and writes output. The merge rule throughout is: structured source > LLM estimate > null.
 
 ---
 
@@ -266,15 +330,15 @@ output/
   intel_corporation_20260624_143201_summary.md     # one-pager for deal review / CRM
 ```
 
-The JSON record follows a versioned schema (`v1.2.0`) with these top-level sections:
+The JSON record follows a versioned schema (`v1.4.0`) with these top-level sections:
 
 | Section | What it contains |
 |---|---|
 | `meta` | Schema version, timestamps, per-section confidence scores, source citations |
 | `overview` | Legal name, ticker, founding year, headcount, industry verticals, summary |
 | `locations` | HQ, fabs, R&D centers, sales offices — typed and status-tagged |
-| `stakeholders` | Decision-makers with role type, influence score, buying relevance notes, and a `verified` flag (true when matched against People Data Labs rather than purely LLM-inferred) |
-| `economics` | Revenue, margins, R&D spend, capex, disclosed segment breakdown, semiconductor profile, and benchmark-derived segment SAM estimates (Power/EP/HPC/CONN/AMS) |
+| `stakeholders` | Decision-makers with role type, influence score, and buying relevance notes, plus a `verified` flag — true when the name matched an Apollo/PDL contact record rather than being inferred from web text. An ungrounded name appears as a role-title placeholder, e.g. `"VP of Procurement (name not found)"`, and is never `verified` |
+| `economics` | Revenue, margins, R&D spend, capex, disclosed segment breakdown, and semiconductor profile. `data_quality` reads `estimated` (with a `notes` string naming the rate) when the figures were FX-converted from a non-USD filing. `segment_sam_estimates` remains in the schema but has **no producer** as of v1.4.0 and will be empty |
 | `account_intelligence` | Opportunity signals, risks, watch items, recommended next action |
 | `news` | Up to 10 recent items tagged by topic |
 
@@ -291,19 +355,20 @@ pip install anthropic httpx pydantic
 ### 2. Set credentials
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-export SEARCH_API_KEY="your-key-here"
-export SEARCH_PROVIDER="serper"        # serper | brave | serpapi
-export PDL_API_KEY="your-pdl-key"      # optional — enables verified stakeholder contacts
-export FCC_APP_TOKEN="your-token"      # optional — raises the FCC Socrata rate limit; not required
-export USPTO_API_KEY="your-uspto-key"  # optional — enables patent inventor lookup + segment activity signals
+export ANTHROPIC_API_KEY="sk-ant-..."   # required
+export SEARCH_API_KEY="your-key-here"   # required
+export SEARCH_PROVIDER="serper"         # serper | brave | serpapi
+export APOLLO_API_KEY="your-apollo-key" # optional — programmatic contacts
+export PDL_API_KEY="your-pdl-key"       # optional — programmatic contacts
 ```
+
+Only the first two are required. `FCC_APP_TOKEN` and `USPTO_API_KEY` are no longer read by anything as of v1.4.0.
 
 Serper (`serper.dev`) is recommended — roughly $0.001 per query, so a full pipeline run costs under $0.02 in search fees.
 
-`PDL_API_KEY` is optional. [People Data Labs](https://www.peopledatalabs.com) offers a free tier (1,000 records/month, no credit card) that's normally enough for regular use. Without it, the pipeline behaves exactly as in v1.0.0 — stakeholders are inferred entirely from web search snippets (and grounding-checked, as of v1.2.0).
+`APOLLO_API_KEY` and `PDL_API_KEY` are both optional and independent — set either, both, or neither. Each supplies stage 2b's structured contact records; a missing key for one provider doesn't disable the other. [People Data Labs](https://www.peopledatalabs.com) offers a free tier (1,000 records/month, no credit card). With neither key set, stakeholders are inferred entirely from web search snippets, and stage 2b is skipped cleanly.
 
-`USPTO_API_KEY` is also optional and free, but requires more setup than the others: a USPTO.gov account verified through ID.me (see `extractors/patent_search.py`'s module docstring, or the pipeline's earlier troubleshooting notes, for the full registration flow). Without it, patent-inventor lookup and the segment patent-activity signal are simply skipped — everything else behaves the same.
+EDGAR needs no key at all, but does send a real `User-Agent` per SEC fair-use policy. The FX conversion for non-USD filers uses ECB reference rates via Frankfurter, which also needs no key.
 
 ### 3. Run
 
@@ -349,15 +414,10 @@ print(record.overview.legal_name)
 print(record.economics.financials.revenue_usd_m)
 print(record.meta.confidence.overall)
 
-# Segment SAM estimates — always 5 entries (power/ep/hpc/conn/ams), even
-# when a given segment couldn't be estimated (benchmark_confidence will
-# read "needs_research" and low/high will be null in that case)
-for est in record.economics.segment_sam_estimates:
-    print(est.segment, est.estimated_sam_low_usd_m, est.estimated_sam_high_usd_m, est.benchmark_confidence)
-
-# Verified stakeholders (matched against People Data Labs)
-verified = [s for s in record.stakeholders if s.verified]
-print(f"{len(verified)} of {len(record.stakeholders)} stakeholders verified")
+# Was the revenue figure filed in USD, or converted from another currency?
+fin = record.economics.financials
+print(fin.data_quality)   # "audited" for a USD filer; "estimated" if FX-converted
+print(fin.notes)          # e.g. "Converted from EUR at 1.175 (2025-12-31, source: ECB)"
 
 # Top stakeholder by influence
 top = max(record.stakeholders, key=lambda s: s.influence_score)
@@ -391,29 +451,39 @@ Optional:
 
 ## Project structure
 
-```
+```text
+run_research.py              # CLI entry point
+requirements.txt
 account_research/
-├── run_research.py          # CLI entry point
-├── requirements.txt
-├── __init__.py
+├── __init__.py              # re-exports AccountResearchPipeline
 │
 ├── models/
 │   └── schema.py            # Pydantic models — AccountResearchRecord and all sub-types
 │
 ├── extractors/
 │   ├── web_search.py            # Multi-query web search (Serper / Brave / SerpAPI)
-│   ├── edgar.py                  # SEC EDGAR XBRL financials (free, no key)
-│   ├── people_search.py         # People Data Labs verified contacts (optional, free tier)
-│   ├── fcc_search.py             # FCC equipment authorization facility lookup (free, no key)
-│   ├── patent_search.py         # USPTO granted-patent inventor + segment activity lookup (optional, free)
+│   ├── edgar.py                  # SEC EDGAR XBRL financials, SIC, FX conversion (free, no key)
+│   ├── people_data.py           # Apollo.io + People Data Labs contacts (optional)
 │   ├── llm_enricher.py          # Section-by-section Claude extraction
-│   ├── segment_benchmarks.py    # Power/EP/HPC/CONN/AMS content benchmarks + SAM math
-│   └── grounding.py              # Post-extraction checks that a claim traces to source text
+│   │
+│   ├── people_search.py         # ORPHANED — superseded by people_data.py
+│   ├── fcc_search.py             # ORPHANED — feature retired
+│   ├── patent_search.py         # ORPHANED — feature retired
+│   ├── segment_benchmarks.py    # ORPHANED — feature retired
+│   └── grounding.py              # ORPHANED — not wired into any stage (see below)
 │
-└── pipeline/
-    ├── pipeline.py          # Orchestrator, output writer, Markdown renderer
-    └── assembler.py         # Merge + validate all sources, score confidence
+├── pipeline/
+│   ├── pipeline.py          # Orchestrator, output writer, Markdown renderer
+│   └── assembler.py         # Merge + validate all sources, score confidence
+│
+├── refresh/
+│   ├── diff.py              # Compare two record snapshots → flat change list
+│   └── refresh_scheduler.py # Tracked-account registry, cadence, re-run + diff
+│
+└── crm/                     # Salesforce sync — stub, not yet implemented
 ```
+
+The five modules marked **ORPHANED** are present on disk but imported by nothing. Four are retired features. `grounding.py` is not a retired feature but a safety mechanism that is currently unwired — see [Grounding safeguards](#grounding-safeguards).
 
 ---
 
@@ -439,13 +509,26 @@ Each section in the output record carries a confidence rating (`high`, `medium`,
 | `medium` | Data partially populated, from web snippets only, or LLM-estimated |
 | `low` | Section mostly empty or company information is sparse / private |
 
-For private companies, `economics` will typically be `low` or `medium`. Stakeholder confidence reaches `high` when either 3+ stakeholders are present OR 2+ are `verified` (PDL-matched) — a smaller set of confirmed contacts counts at least as much as a larger set of purely LLM-inferred ones.
+For private companies, `economics` will typically be `low` or `medium`. As of v1.4.0 the per-section rules are plain counts: `locations` reaches `high` at 2+ entries, `stakeholders` at 3+. The earlier special cases — a `high` on 2+ PDL-`verified` stakeholders, and a `high` on a single FCC-corroborated address — went away with the sources that fed them.
 
-`segment_sam_estimates` uses a **separate** confidence vocabulary — `benchmark_confidence` (`sourced` / `directional` / `needs_research`) — and deliberately does **not** factor into the `economics` confidence score above. A segment SAM estimate is never "audited" data; conflating the two would overstate how well-founded the economics section is.
+Note that a `high` on `economics` means the figures came from EDGAR — including the case where they were **FX-converted** from a non-USD filing. The conversion is disclosed via `financials.data_quality` (`estimated`) and `financials.notes` rather than by lowering the section confidence, so check those two fields before treating a `high` economics figure as filed-in-dollars.
 
 ---
 
 ## Grounding safeguards
+
+> **Active again as of v1.4.1.** `extractors/grounding.py` was briefly orphaned
+> during the four-stage restructure — imported by nothing, so nothing re-checked
+> that a stakeholder name, figure, or news URL traced back to anything real. It is
+> now wired back into `llm_enricher.py` and runs on every enrichment.
+>
+> Two details differ from the original wiring described below. Stakeholder names
+> are grounded against the web snippets **or** the programmatic Apollo/PDL contact
+> list — checking snippets alone would delete real verified contacts, who
+> frequently have no web presence at all. And LLM-derived economics figures are
+> grounded, while EDGAR-sourced figures are exempt: those are audited, and
+> grounding them against search snippets would null a filed number for the crime
+> of not appearing in a blog post.
 
 Pydantic validation (in `assembler.py`) checks that LLM output has the right **shape** — it says nothing about whether the content is **true**. A well-formed, schema-valid stakeholder name, disclosed unit volume, or news URL can still be entirely invented by the model.
 
@@ -493,6 +576,15 @@ The `economics.semiconductor_profile` section is purpose-built for semiconductor
 
 ### Segment SAM estimates (`economics.segment_sam_estimates`)
 
+> **⚠ Retired (as of v1.4.0).** `extractors/segment_benchmarks.py` is orphaned and
+> no pipeline stage produces segment SAM estimates, so
+> `economics.segment_sam_estimates` will be an empty list. The field, the
+> `Segment` enum and `SegmentSAMEstimate` all remain in the schema, so a record
+> produced by an earlier version still validates — except that `Segment` no longer
+> accepts `"conn"` (see the v1.4.0 changelog entry). `research_record_viewer.jsx`'s
+> Segment SAM tab will therefore render empty for newly produced records.
+> Everything below documents the design as built, for whenever it's revived.
+
 For **target accounts you sell chips to** (as opposed to semiconductor suppliers themselves), a customer's own 10-K never breaks spend down by chip product category — that taxonomy belongs to suppliers, not buyers. `segment_sam_estimates` fills that gap with a **benchmark-derived estimate**, not a disclosed figure:
 
 ```json
@@ -532,13 +624,13 @@ Extend `BENCHMARKS` in `extractors/segment_benchmarks.py` as better sourcing bec
 
 ## Extending the pipeline
 
-**Add a new data source** — implement a new extractor in `extractors/`, call it from `pipeline.py` in the run sequence, and pass its output to `assembler.py`. The assembler's merge logic follows the pattern: structured source > LLM estimate > null. `extractors/people_search.py` is a working example of this pattern — see `pipeline.py`'s Stage 3 (fully optional, skipped if `PDL_API_KEY` is unset) and `assembler.py`'s `_build_stakeholders()`, which matches PDL contacts by name, overrides LLM-inferred contact fields with structured data on a match, and adds any unmatched verified contact via a safety net.
+**Add a new data source** — implement a new extractor in `extractors/`, call it from `pipeline.py` in the run sequence, and pass its output to `assembler.py`. The assembler's merge logic follows the pattern: structured source > LLM estimate > null. `extractors/people_data.py` is the current working example — see `pipeline.py`'s Stage 2b (fully optional, skipped if neither `APOLLO_API_KEY` nor `PDL_API_KEY` is set) and how its normalized contacts reach `assemble()` via the `programmatic_stakeholders` argument.
 
 **Add a new schema field** — add the field to the relevant Pydantic model in `models/schema.py`, add it to the corresponding LLM prompt in `llm_enricher.py`, and handle it in `assembler.py`.
 
-**Add or refine a segment SAM benchmark** — add/edit an entry in `BENCHMARKS` in `extractors/segment_benchmarks.py` with a real, dated source; no other file needs to change.
+**Add or refine a segment SAM benchmark** — add/edit an entry in `BENCHMARKS` in `extractors/segment_benchmarks.py` with a real, dated source. *Note: that module is orphaned as of v1.4.0, so re-wiring the stage into `pipeline.py` is a prerequisite for any of it taking effect.*
 
-**Add a grounding check for a new high-risk field** — add a function to `extractors/grounding.py` following the pattern of `text_contains_claim`/`number_grounded`/`is_url_grounded`, then call it in `llm_enricher.py` right after the relevant `_call()` returns, before the value is merged into the section dict. If the field can legitimately be sourced from something other than raw web text (as stakeholder names can from PDL), make sure the grounding source text includes that other source too — see `_extract_stakeholders` for the pattern.
+**Re-wire the grounding pass** — `extractors/grounding.py` is currently called from nowhere (see [Grounding safeguards](#grounding-safeguards)). To bring it back, call its `text_contains_claim` / `number_grounded` / `is_url_grounded` helpers from `llm_enricher.py` right after the relevant `_call()` returns, before the value is merged into the section dict. If a field can legitimately be sourced from something other than raw web text — as stakeholder names can from Apollo/PDL — make sure the grounding source text includes that other source too, or real contacts will be discarded as ungrounded.
 
 **Push to CRM** — call `record.model_dump()` after `pipeline.run()` and map the dict to your CRM's API fields. The schema is designed to map cleanly to Salesforce Account + Contact objects.
 
@@ -590,4 +682,6 @@ If you hit this error on a *different* library this pipeline doesn't control (e.
 - `truststore >= 0.9.0` — required, not optional; see [A note on corporate networks](#a-note-on-corporate-networks) below
 - A search API key (Serper, Brave, or SerpAPI)
 - An Anthropic API key
-- `PDL_API_KEY` (optional) — for verified stakeholder contacts via People Data Labs
+- `APOLLO_API_KEY` and/or `PDL_API_KEY` (both optional, independent) — for programmatic contact records
+
+No key is needed for SEC EDGAR or for the ECB reference rates used to convert a non-USD filer's figures.

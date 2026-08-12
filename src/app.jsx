@@ -77,20 +77,6 @@ const CSS = `
   input:focus { border-color: var(--border-accent); }
   input::placeholder { color: var(--text-muted); }
 
-  select, textarea {
-    font-family: var(--font-sans);
-    font-size: 13px;
-    background: var(--surface-1);
-    border: 0.5px solid var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text-primary);
-    padding: 8px 12px;
-    outline: none;
-    transition: border-color .15s;
-  }
-  select:focus, textarea:focus { border-color: var(--border-accent); }
-  textarea { font-family: inherit; resize: vertical; line-height: 1.5; }
-
   button {
     font-family: var(--font-sans);
     font-size: 13px;
@@ -161,49 +147,260 @@ const sigC  = t => ({opportunity:"var(--text-success)",risk:"var(--text-danger)"
 const sigB  = t => ({opportunity:"var(--bg-success)",risk:"var(--bg-danger)",watch:"var(--bg-warning)"}[t]||"var(--surface-1)");
 const sigBr = t => ({opportunity:"var(--border-success)",risk:"var(--border-danger)",watch:"var(--border-warning)"}[t]||"var(--border)");
 
+// ── Diffing (mirrors the Python refresh/diff.py logic) ──────────
+const listDiff = (oldList=[], newList=[]) => {
+  const oldNorm = new Set(oldList.map(x=>String(x||"").toLowerCase().trim()));
+  const newNorm = new Set(newList.map(x=>String(x||"").toLowerCase().trim()));
+  return {
+    added:   newList.filter(x=>!oldNorm.has(String(x||"").toLowerCase().trim())),
+    removed: oldList.filter(x=>!newNorm.has(String(x||"").toLowerCase().trim())),
+  };
+};
+
+function diffRecords(oldRec, newRec) {
+  if (!oldRec) return [];
+  const changes = [];
+  const push = (section,type,headline) => changes.push({section,type,headline});
+
+  // Overview
+  const oo = oldRec.overview||{}, no = newRec.overview||{};
+  if ((oo.ownership_type||null) !== (no.ownership_type||null) && (oo.ownership_type||no.ownership_type))
+    push("overview","changed",`Ownership type: ${oo.ownership_type||"—"} → ${no.ownership_type||"—"}`);
+  if ((oo.founded_year||null) !== (no.founded_year||null) && (oo.founded_year||no.founded_year))
+    push("overview","changed",`Founded year: ${oo.founded_year||"—"} → ${no.founded_year||"—"}`);
+  const oSym = oo.ticker?.symbol||null, nSym = no.ticker?.symbol||null;
+  if (oSym !== nSym) push("overview","changed",`Ticker: ${oSym||"—"} → ${nSym||"—"}`);
+  const oEmp = oo.employee_count?.value, nEmp = no.employee_count?.value;
+  if (oEmp && nEmp && oEmp !== nEmp) {
+    const pct = ((nEmp-oEmp)/oEmp*100).toFixed(0);
+    push("overview","changed",`Employee count: ${oEmp.toLocaleString()} → ${nEmp.toLocaleString()} (${pct>0?"+":""}${pct}%)`);
+  }
+  [["Industry verticals","industry_verticals"],["Competitors","competitors"]].forEach(([label,key])=>{
+    const {added,removed} = listDiff(oo[key]||[], no[key]||[]);
+    added.forEach(a=>push("overview","added",`${label}: +${a}`));
+    removed.forEach(r=>push("overview","removed",`${label}: -${r}`));
+  });
+
+  // Locations
+  const locKey = l => `${(l.type||"").toLowerCase()}|${(l.city||"").toLowerCase()}|${(l.country||"").toLowerCase()}`;
+  const oLocs = new Map((oldRec.locations||[]).map(l=>[locKey(l),l]));
+  const nLocs = new Map((newRec.locations||[]).map(l=>[locKey(l),l]));
+  nLocs.forEach((loc,key)=>{
+    if (!oLocs.has(key)) push("locations","added",`New location: ${(loc.type||"").toUpperCase()} — ${loc.city}, ${loc.country}`);
+    else if (oLocs.get(key).status !== loc.status) push("locations","changed",`${loc.city} status: ${oLocs.get(key).status} → ${loc.status}`);
+  });
+  oLocs.forEach((loc,key)=>{
+    if (!nLocs.has(key)) push("locations","removed",`Location no longer listed: ${(loc.type||"").toUpperCase()} — ${loc.city}, ${loc.country}`);
+  });
+
+  // Stakeholders
+  const nameKey = s => (s.name||"").toLowerCase().trim();
+  const oStk = new Map((oldRec.stakeholders||[]).filter(s=>s.name).map(s=>[nameKey(s),s]));
+  const nStk = new Map((newRec.stakeholders||[]).filter(s=>s.name).map(s=>[nameKey(s),s]));
+  nStk.forEach((s,key)=>{
+    if (!oStk.has(key)) push("stakeholders","added",`New stakeholder: ${s.name} (${s.title||"—"})`);
+    else {
+      const old = oStk.get(key);
+      if ((old.title||"") !== (s.title||"")) push("stakeholders","changed",`${s.name} title changed: ${old.title||"—"} → ${s.title||"—"}`);
+      const oldInf = old.influence_score||0, newInf = s.influence_score||0;
+      if (Math.abs(oldInf-newInf) >= 0.15) push("stakeholders","changed",`${s.name} influence: ${Math.round(oldInf*100)}% → ${Math.round(newInf*100)}%`);
+    }
+  });
+  oStk.forEach((s,key)=>{
+    if (!nStk.has(key)) push("stakeholders","removed",`Stakeholder no longer listed: ${s.name} (${s.title||"—"})`);
+  });
+
+  // Economics
+  const of = oldRec.economics?.financials||{}, nf = newRec.economics?.financials||{};
+  if (of.revenue_usd_m && nf.revenue_usd_m && Math.abs(of.revenue_usd_m-nf.revenue_usd_m)/of.revenue_usd_m > 0.03) {
+    const pct = ((nf.revenue_usd_m-of.revenue_usd_m)/of.revenue_usd_m*100).toFixed(1);
+    push("economics","changed",`Revenue: ${fmtM(of.revenue_usd_m)} → ${fmtM(nf.revenue_usd_m)} (${pct>0?"+":""}${pct}%)`);
+  }
+  if (of.gross_margin_pct!=null && nf.gross_margin_pct!=null && Math.abs(of.gross_margin_pct-nf.gross_margin_pct)>=1)
+    push("economics","changed",`Gross margin: ${fmtP(of.gross_margin_pct)} → ${fmtP(nf.gross_margin_pct)}`);
+  if ((of.data_quality||null) !== (nf.data_quality||null))
+    push("economics","changed",`Financial data quality: ${of.data_quality||"—"} → ${nf.data_quality||"—"}`);
+
+  const os = oldRec.economics?.semiconductor_profile||{}, ns = newRec.economics?.semiconductor_profile||{};
+  if ((os.chip_buyer_type||null) !== (ns.chip_buyer_type||null))
+    push("economics","changed",`Chip buyer type: ${os.chip_buyer_type||"—"} → ${ns.chip_buyer_type||"—"}`);
+  [["Fab nodes","fab_nodes"],["Known chip suppliers","known_chip_suppliers"],["Known supply gaps","known_supply_gaps"]].forEach(([label,key])=>{
+    const {added,removed} = listDiff(os[key]||[], ns[key]||[]);
+    added.forEach(a=>push("economics","added",`${label}: +${a}`));
+    removed.forEach(r=>push("economics","removed",`${label}: -${r}`));
+  });
+
+  // Intelligence
+  const oi = oldRec.account_intelligence||{}, ni = newRec.account_intelligence||{};
+  if ((oi.current_supplier_status||null) !== (ni.current_supplier_status||null))
+    push("intelligence","changed",`Supplier status: ${oi.current_supplier_status||"—"} → ${ni.current_supplier_status||"—"}`);
+  const sigKey = s => (s.description||"").toLowerCase().trim().slice(0,80);
+  const oSigs = new Map((oi.opportunity_signals||[]).map(s=>[sigKey(s),s]));
+  const nSigs = new Map((ni.opportunity_signals||[]).map(s=>[sigKey(s),s]));
+  nSigs.forEach((s,key)=>{ if (!oSigs.has(key)) push("intelligence","added",`New ${s.type} signal: ${s.description}`); });
+  oSigs.forEach((s,key)=>{ if (!nSigs.has(key)) push("intelligence","removed",`Signal resolved/no longer active: ${s.description}`); });
+
+  // News
+  const newsKey = n => `${(n.headline||"").toLowerCase().trim()}|${n.date}`;
+  const oNews = new Set((oldRec.news||[]).map(newsKey));
+  (newRec.news||[]).forEach(n=>{ if (!oNews.has(newsKey(n))) push("news","added",`${n.date} — ${n.headline}`); });
+
+  // Confidence
+  const oConf = oldRec.meta?.confidence?.overall, nConf = newRec.meta?.confidence?.overall;
+  if (oConf !== nConf) push("overview","changed",`Overall confidence: ${oConf||"—"} → ${nConf||"—"}`);
+
+  return changes;
+}
+
+const CHANGE_ICON = {added:"ti-plus",removed:"ti-minus",changed:"ti-arrow-right"};
+const CHANGE_COLOR = {added:"var(--text-success)",removed:"var(--text-danger)",changed:"var(--text-accent)"};
+
+// ── Programmatic contacts: Apollo.io + PDL ──────────────────────
+// EXPERIMENTAL: these call third-party B2B data APIs directly from the
+// browser. Two real risks worth knowing before relying on this:
+//   1. Your API key is visible in this file and in the browser's network
+//      tab to anyone who opens dev tools on this artifact.
+//   2. Apollo/PDL are built for server-side use and may not send the
+//      CORS headers needed for a browser to read the response at all —
+//      if that's the case, the fetch will fail and this silently falls
+//      back to LLM-only stakeholders below.
+// The Python pipeline's extractors/people_data.py does the same thing
+// server-side, without either risk, and is the more reliable path.
+
+const ENGINEERING_TITLES = ["engineer","principal engineer","staff engineer","senior engineer",
+  "process engineer","device engineer","test engineer","product engineer","applications engineer",
+  "design engineer","validation engineer","packaging engineer","yield engineer","hardware engineer",
+  "firmware engineer","systems engineer","integration engineer"];
+const LEADERSHIP_TITLES = ["procurement","supply chain","sourcing","purchasing","vp engineering",
+  "director engineering","cto","chief technology officer","vp operations","head of engineering","engineering manager"];
+const SENIORITY_INFLUENCE = {owner:0.95,founder:0.95,c_suite:0.95,vp:0.8,head:0.75,director:0.65,manager:0.5,senior:0.4,entry:0.25};
+
+function inferRoleType(title="", seniority="") {
+  const t = title.toLowerCase(), s = (seniority||"").toLowerCase();
+  if (["chief","president","cto","ceo","coo"].some(k=>t.includes(k)) || ["c_suite","owner","founder"].includes(s)) return "executive_sponsor";
+  if (["procurement","sourcing","supply chain","purchasing"].some(k=>t.includes(k))) return "economic_buyer";
+  if (["engineer","architect","technical","developer"].some(k=>t.includes(k))) return "technical_buyer";
+  if (["vp","head","director"].includes(s)) return "executive_sponsor";
+  if (s==="manager") return "influencer";
+  return "influencer";
+}
+function inferInfluence(seniority, roleType) {
+  let base = SENIORITY_INFLUENCE[(seniority||"").toLowerCase()] ?? 0.35;
+  if (roleType==="economic_buyer") base = Math.max(base, 0.7);
+  return Math.round(Math.min(base,1)*100)/100;
+}
+function contactToStakeholder(c) {
+  const roleType = inferRoleType(c.title, c.seniority);
+  return {
+    name: c.name, title: c.title||"Unknown title",
+    department: roleType==="technical_buyer" ? "Engineering" : null,
+    location: c.location||null, role_type: roleType,
+    influence_score: inferInfluence(c.seniority, roleType),
+    relationship_status: "cold", linkedin_url: c.linkedin_url||null, email: c.email||null,
+    notes: `Sourced from ${c.source||"contact database"} — not yet contacted.`,
+  };
+}
+function dedupeContacts(contacts) {
+  const merged = new Map();
+  for (const c of contacts) {
+    const key = (c.name||"").trim().toLowerCase();
+    if (!key) continue;
+    if (!merged.has(key)) merged.set(key, {...c});
+    else {
+      const existing = merged.get(key);
+      for (const f of ["title","seniority","location","linkedin_url","email"]) {
+        if (!existing[f] && c[f]) existing[f] = c[f];
+      }
+      if (c.source && !existing.source?.includes(c.source)) existing.source = `${existing.source||""}+${c.source}`.replace(/^\+/,"");
+    }
+  }
+  return [...merged.values()];
+}
+
+async function fetchApolloContacts(domain, apiKey, titles, perPage=25) {
+  if (!apiKey) return [];
+  try {
+    const params = new URLSearchParams();
+    params.append("q_organization_domains_list[]", domain);
+    titles.forEach(t=>params.append("person_titles[]", t));
+    params.append("include_similar_titles","true");
+    params.append("per_page", String(Math.min(perPage,100)));
+    params.append("page","1");
+    const r = await fetch(`https://api.apollo.io/api/v1/mixed_people/api_search?${params.toString()}`, {
+      method:"POST",
+      headers:{"X-Api-Key":apiKey,"Content-Type":"application/json","Cache-Control":"no-cache","accept":"application/json"},
+    });
+    if (!r.ok) throw new Error(`Apollo ${r.status}`);
+    const data = await r.json();
+    return (data.people||[]).map(p=>({
+      name: p.name || `${p.first_name||""} ${p.last_name||""}`.trim(),
+      title: p.title||"", seniority: p.seniority,
+      location: [p.city,p.state].filter(Boolean).join(", ")||null,
+      linkedin_url: p.linkedin_url, email: p.email||null, source:"apollo",
+    }));
+  } catch (e) { console.warn("[apollo] fetch failed (likely CORS or invalid key):", e.message); return []; }
+}
+
+async function fetchPDLContacts(domain, apiKey, jobTitleRole=null, size=25) {
+  if (!apiKey) return [];
+  try {
+    const must = [{term:{job_company_website:domain}}];
+    if (jobTitleRole) must.push({term:{job_title_role:jobTitleRole}});
+    const params = new URLSearchParams({query:JSON.stringify({query:{bool:{must}}}), size:String(size), pretty:"false"});
+    const r = await fetch(`https://api.peopledatalabs.com/v5/person/search?${params.toString()}`, {
+      headers:{"X-Api-Key":apiKey},
+    });
+    if (!r.ok) throw new Error(`PDL ${r.status}`);
+    const data = await r.json();
+    if (data.status !== 200) return [];
+    return (data.data||[]).map(p=>({
+      name: p.full_name||"", title: p.job_title||"",
+      seniority: (p.job_title_levels||[])[0],
+      location: p.location_name||null,
+      linkedin_url: p.linkedin_url, email: p.work_email||null, source:"pdl",
+    }));
+  } catch (e) { console.warn("[pdl] fetch failed (likely CORS or invalid key):", e.message); return []; }
+}
+
+async function fetchProgrammaticContacts(domain, apolloKey, pdlKey, targetCount=20) {
+  if (!apolloKey && !pdlKey) return [];
+  const engSlots = Math.max(1, Math.round(targetCount*0.65));
+  const leadSlots = Math.max(1, targetCount-engSlots);
+
+  const [apolloEng, apolloLead, pdlEng, pdlLead] = await Promise.all([
+    fetchApolloContacts(domain, apolloKey, ENGINEERING_TITLES, engSlots*2),
+    fetchApolloContacts(domain, apolloKey, LEADERSHIP_TITLES, leadSlots*2),
+    fetchPDLContacts(domain, pdlKey, "engineering", engSlots*2),
+    fetchPDLContacts(domain, pdlKey, null, leadSlots*2),
+  ]);
+
+  const deduped = dedupeContacts([...apolloEng,...apolloLead,...pdlEng,...pdlLead]);
+  if (!deduped.length) return [];
+
+  const engineers = deduped.filter(c=>inferRoleType(c.title,c.seniority)==="technical_buyer");
+  const others = deduped.filter(c=>!engineers.includes(c));
+  let selected = [...engineers.slice(0,engSlots), ...others.slice(0,leadSlots)];
+  if (selected.length < targetCount) {
+    const remaining = deduped.filter(c=>!selected.includes(c));
+    selected = [...selected, ...remaining.slice(0, targetCount-selected.length)];
+  }
+  return selected.slice(0,targetCount).map(contactToStakeholder);
+}
+
+function mergeStakeholderSources(llmList=[], programmaticList=[]) {
+  const key = s => (s.name||"").trim().toLowerCase();
+  const merged = new Map();
+  llmList.forEach(s => { const k=key(s); if (k) merged.set(k,s); });
+  programmaticList.forEach(s => { const k=key(s); if (k && !merged.has(k)) merged.set(k,s); });
+  return [...merged.values()].sort((a,b)=>(b.influence_score||0)-(a.influence_score||0)).slice(0,25);
+}
+
 // ── API ────────────────────────────────────────────────────────
 const SYS = `You are a semiconductor sales intelligence extractor. Return ONLY valid JSON. Use null for unknowns. Never fabricate specific numbers. data_quality: "audited"|"estimated"|"inferred".`;
 
-// Finds the first complete JSON value (object or array) in `text` by
-// scanning for balanced brackets, correctly skipping over string contents
-// (so braces/brackets inside quoted strings don't throw off the depth
-// count, and escaped quotes don't prematurely end a string). Returns the
-// exact substring for that value — ignoring any leading preamble *and*
-// any trailing prose Claude appended after the JSON closes (e.g. "I found
-// these from Qualcomm's investor relations page."), which a plain
-// greedy regex match can't distinguish from part of the JSON itself.
-// Returns null if the brackets never balance (e.g. a genuinely truncated
-// response) — the caller's own JSON.parse then surfaces that failure.
-function extractJson(text) {
-  const start = text.search(/[[{]/);
-  if (start === -1) return null;
-
-  const openChar = text[start];
-  const closeChar = openChar === "{" ? "}" : "]";
-  let depth = 0;
-  let inString = false;
-  let escapeNext = false;
-
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-
-    if (escapeNext) { escapeNext = false; continue; }
-    if (ch === "\\" && inString) { escapeNext = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-
-    if (ch === openChar) depth++;
-    else if (ch === closeChar) {
-      depth--;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
-  }
-  return null;
-}
-
-async function apiCall(prompt, webSearch = false, maxTokens = 2000) {
+async function apiCall(prompt, webSearch = false) {
   const body = {
-    model: MODEL, max_tokens: maxTokens, system: SYS,
+    model: MODEL, max_tokens: 2000, system: SYS,
     messages: [{ role: "user", content: prompt }],
   };
   if (webSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
@@ -214,10 +411,9 @@ async function apiCall(prompt, webSearch = false, maxTokens = 2000) {
   const d = await r.json();
   const text = d.content.filter(b => b.type === "text").map(b => b.text).join("");
   const clean = text.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim();
-  try {
-    const extracted = extractJson(clean);
-    return JSON.parse(extracted !== null ? extracted : clean);
-  } catch {
+  try { return JSON.parse(clean); } catch {
+    const m = clean.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (m) return JSON.parse(m[0]);
     throw new Error("JSON parse failed");
   }
 }
@@ -225,7 +421,7 @@ async function apiCall(prompt, webSearch = false, maxTokens = 2000) {
 const runOverview = (co, domain, ticker) => apiCall(
 `Research "${co}" (domain:${domain}${ticker?", ticker:"+ticker:""}). Return JSON with exactly these two keys:
 {"overview":{"legal_name":string,"doing_business_as":string|null,"ticker":{"symbol":string,"exchange":string}|null,"ownership_type":"public"|"private"|"subsidiary"|"jv"|"government","parent_company":string|null,"founded_year":integer|null,"website":string,"industry_verticals":[string],"employee_count":{"value":integer,"approximate":boolean}|null,"summary":"3-4 sentences covering what they do, market position, and relevance to a semiconductor supplier","competitors":[string],"key_products":[string]},"locations":[{"type":"hq"|"regional_hq"|"fab"|"assembly"|"rd_center"|"design_center"|"sales_office","name":string|null,"city":string,"state_region":string|null,"country":string,"country_code":"2-letter ISO","status":"active"|"ramping"|"under_construction"|"planned"|"closed","notes":string|null}]}
-HQ first. Max 10 locations. For semiconductor companies distinguish fab sites from offices.`, true, 4096);
+HQ first. Max 10 locations. For semiconductor companies distinguish fab sites from offices.`, true);
 
 const runEconomics = (co, ticker) => apiCall(
 `Financial and semiconductor data for "${co}"${ticker?" (ticker:"+ticker+")":"(private company)"}. Return JSON:
@@ -240,7 +436,7 @@ economic_buyer=0.8-1.0, technical_buyer=0.6-0.8. Prioritize: procurement VP, CTO
 const runIntelligence = (co) => apiCall(
 `Semiconductor supplier account intelligence for "${co}". Return JSON:
 {"account_intelligence":{"opportunity_signals":[{"type":"opportunity"|"risk"|"watch","description":"1-2 actionable sentences","urgency":"immediate"|"near_term"|"long_term","source":string|null}],"recommended_next_action":string|null,"current_supplier_status":"no_relationship"|"evaluation"|"approved_vendor"|"active_account"|"strategic_partner"},"news":[{"date":"YYYY-MM-DD","headline":string,"summary":string|null,"source_name":string,"url":string|null,"tags":[string]}]}
-3-5 signals covering expansion plans, qualification cycles, competitive risks. 5-7 news items.`, true, 4096);
+3-5 signals covering expansion plans, qualification cycles, competitive risks. 5-7 news items.`, true);
 
 // ── Export ─────────────────────────────────────────────────────
 function toMarkdown(r) {
@@ -297,13 +493,6 @@ ${news||"| — | — | — |"}
 function toHtmlReport(r) {
   const ov = r.overview||{}, f = r.economics?.financials||{}, semi = r.economics?.semiconductor_profile||{}, intel = r.account_intelligence||{};
   const esc = s => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  // Browsers suggest the <title> (sanitized) as the default filename in the
-  // Save-as-PDF print dialog. Build something filesystem-friendly here
-  // rather than the raw display title — mirrors the Python pipeline's
-  // `<slug>_<date>` output naming so a PDF and its JSON/summary counterpart
-  // are easy to tell apart on disk.
-  const pdfDate = new Date().toISOString().slice(0, 10);
-  const pdfFileTitle = `${slug(ov.legal_name || r.company_name).replace(/_+$/, "")}_account_research_${pdfDate}`;
   const val = v => `<span style="color:#111">${esc(v||"—")}</span>`;
   const badge = (text, color="#555", bg="#f0f0f0") => `<span style="display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;background:${bg};color:${color};font-weight:500;white-space:nowrap">${esc(text)}</span>`;
   const sigColor = t => ({opportunity:["#166534","#f0fdf4","#bbf7d0"],risk:["#991b1b","#fff1f1","#fecaca"],watch:["#92400e","#fffbeb","#fde68a"]}[t]||["#555","#f9f9f9","#e5e7eb"]);
@@ -364,7 +553,7 @@ function toHtmlReport(r) {
     ["Market Cap", fmtM(f.market_cap_usd_m), ""],
   ];
 
-  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${esc(pdfFileTitle)}</title>
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>${esc(ov.legal_name||r.company_name)} — Account Intelligence</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;font-size:14px;line-height:1.5}
@@ -429,26 +618,22 @@ function toHtmlReport(r) {
 
   <div class="footer">Account Research Pipeline v1.0.0 · Generated ${fmtD(r.meta?.refreshed_at||new Date())}</div>
 </body></html>`;
-
-  return { html, filename: pdfFileTitle };
 }
 
-function downloadHtmlReport(r) {
-  const { html, filename } = toHtmlReport(r);
-  // Artifacts run in a sandboxed iframe, so target="_blank" can't actually
-  // open a real new tab — Chrome silently falls back to downloading the
-  // blob instead, using a generic name ("download.html") if we don't set
-  // one explicitly. Setting `download` here is what actually controls the
-  // saved filename; target/rel do nothing once `download` is present.
+function openPdfReport(r) {
+  const html = toHtmlReport(r);
+  // Use a blob URL — works inside sandboxed iframes where window.open("","_blank") is blocked
   const blob = new Blob([html], { type: "text/html" });
   const url  = URL.createObjectURL(blob);
   const a    = Object.assign(document.createElement("a"), {
-    href:     url,
-    download: `${filename}.html`,
+    href:   url,
+    target: "_blank",
+    rel:    "noopener noreferrer",
   });
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+  // Revoke after a short delay so the new tab has time to load
   setTimeout(() => URL.revokeObjectURL(url), 10000);
   return true;
 }
@@ -531,67 +716,76 @@ function FieldRow({ label, value, mono }) {
   );
 }
 
-// ── Editable-field atoms ────────────────────────────────────────
-// Used by every section's edit mode. Each renders a labeled row: plain
-// text when read-only, a real input when editable — so section components
-// only need one branch rather than duplicating markup for both states.
-function EditRow({ label, children }) {
+// ── Changes banner (shown once, right after a re-run) ───────────
+function ChangesBanner({ changes, expanded, onDismiss, onViewAll }) {
+  if (!changes || !changes.length) return null;
+  const preview = expanded ? changes : changes.slice(0,4);
   return (
-    <div style={{padding:"6px 0",borderBottom:"0.5px solid var(--border)"}}>
-      <label style={{display:"block",fontSize:11,color:"var(--text-muted)",marginBottom:4}}>{label}</label>
-      {children}
+    <div style={{margin:"0 1.5rem 1rem",padding:"12px 16px",background:"var(--bg-accent)",border:"0.5px solid var(--border-accent)",borderRadius:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <i className="ti ti-sparkles" style={{fontSize:15,color:"var(--text-accent)"}}/>
+          <span style={{fontSize:13,fontWeight:500,color:"var(--text-accent)"}}>{changes.length} change{changes.length!==1?"s":""} since last research</span>
+        </div>
+        <button onClick={onDismiss} style={{fontSize:11,padding:"3px 8px"}}>Dismiss</button>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:4}}>
+        {preview.map((c,i) => (
+          <div key={i} style={{display:"flex",alignItems:"flex-start",gap:6,fontSize:12,color:"var(--text-primary)"}}>
+            <i className={`ti ${CHANGE_ICON[c.type]}`} style={{fontSize:11,color:CHANGE_COLOR[c.type],marginTop:2,flexShrink:0}}/>
+            <span>{c.headline}</span>
+          </div>
+        ))}
+      </div>
+      {changes.length>preview.length && (
+        <button onClick={onViewAll} style={{fontSize:11,padding:"4px 8px",marginTop:8}}>
+          View all {changes.length} changes →
+        </button>
+      )}
     </div>
   );
 }
 
-function Field({ label, value, onChange, editable, type="text", mono, options=[] }) {
-  if (!editable) {
-    const display = type==="list" ? (Array.isArray(value)?value.join(", "):value) : value;
-    return <FieldRow label={label} value={display} mono={mono}/>;
-  }
-  return (
-    <EditRow label={label}>
-      {type==="select" ? (
-        <select value={value||""} onChange={e=>onChange(e.target.value)} style={{width:"100%"}}>
-          {options.map(o=><option key={o} value={o}>{o.replace(/_/g," ")}</option>)}
-        </select>
-      ) : type==="number" ? (
-        <input type="number" step="any" value={value ?? ""} placeholder="—"
-          onChange={e=>onChange(e.target.value===""?null:Number(e.target.value))}
-          style={{width:"100%",fontFamily:mono?"var(--font-mono)":undefined}}/>
-      ) : type==="checkbox" ? (
-        <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer"}}>
-          <input type="checkbox" checked={!!value} onChange={e=>onChange(e.target.checked)} style={{width:"auto"}}/>
-          {value ? "Yes" : "No"}
-        </label>
-      ) : type==="list" ? (
-        <input value={Array.isArray(value)?value.join(", "):(value||"")} placeholder="Comma-separated"
-          onChange={e=>onChange(e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
-          style={{width:"100%"}}/>
-      ) : type==="textarea" ? (
-        <textarea value={value||""} onChange={e=>onChange(e.target.value)} style={{width:"100%",minHeight:70}}/>
-      ) : (
-        <input value={value||""} onChange={e=>onChange(e.target.value)}
-          style={{width:"100%",fontFamily:mono?"var(--font-mono)":undefined}}/>
-      )}
-    </EditRow>
-  );
-}
+// ── Changelog panel (full history, persisted in shared storage) ─
+function ChangelogPanel({ record, onClose }) {
+  const [entries, setEntries] = useState(null);
 
-function RemoveRowButton({ onClick, title="Remove" }) {
-  return (
-    <button onClick={(e)=>{e.stopPropagation(); onClick();}} title={title}
-      style={{fontSize:11,padding:"3px 7px",display:"flex",alignItems:"center",gap:4,color:"var(--text-danger)",background:"transparent",borderColor:"var(--border)",flexShrink:0}}>
-      <i className="ti ti-x" style={{fontSize:13}}/>
-    </button>
-  );
-}
+  useEffect(() => {
+    (async () => {
+      try {
+        const key = `changelog:${normKey(record)}`;
+        const r = await window.storage.get(key, true);
+        setEntries(r?.value ? JSON.parse(r.value) : []);
+      } catch { setEntries([]); }
+    })();
+  }, [record]);
 
-function AddRowButton({ onClick, label }) {
   return (
-    <button onClick={onClick} style={{fontSize:12,padding:"6px 12px",display:"flex",alignItems:"center",gap:6,justifyContent:"center",width:"100%",borderStyle:"dashed"}}>
-      <i className="ti ti-plus" style={{fontSize:13}}/>{label}
-    </button>
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={onClose}>
+      <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,width:520,maxHeight:"75vh",display:"flex",flexDirection:"column",overflow:"hidden"}} onClick={e=>e.stopPropagation()}>
+        <div style={{padding:"1rem 1.25rem",borderBottom:"0.5px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+          <p style={{fontSize:14,fontWeight:500,margin:0}}>Change history — {record.overview?.legal_name||record.company_name}</p>
+          <button onClick={onClose} style={{fontSize:12,padding:"3px 9px"}}><i className="ti ti-x" style={{fontSize:12}}/></button>
+        </div>
+        <div style={{flex:1,overflowY:"auto",padding:"0.5rem 1.25rem"}}>
+          {entries===null && <p style={{fontSize:13,color:"var(--text-muted)",padding:"1rem 0"}}>Loading…</p>}
+          {entries && !entries.length && <p style={{fontSize:13,color:"var(--text-muted)",padding:"1rem 0"}}>No prior changes recorded yet — this builds up each time research is re-run and saved.</p>}
+          {entries && entries.map((entry,i) => (
+            <div key={i} style={{padding:"12px 0",borderBottom:i<entries.length-1?"0.5px solid var(--border)":"none"}}>
+              <p style={{fontSize:11,color:"var(--text-muted)",margin:"0 0 6px",fontFamily:"var(--font-mono)"}}>{fmtD(entry.timestamp)}</p>
+              <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                {entry.changes.map((c,j) => (
+                  <div key={j} style={{display:"flex",alignItems:"flex-start",gap:6,fontSize:12,color:"var(--text-primary)"}}>
+                    <i className={`ti ${CHANGE_ICON[c.type]}`} style={{fontSize:11,color:CHANGE_COLOR[c.type],marginTop:2,flexShrink:0}}/>
+                    <span>{c.headline}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -633,83 +827,45 @@ function PipelineTracker({ statuses }) {
 }
 
 // ── Tab sections ───────────────────────────────────────────────
-function OverviewSection({ r, editable, onChange }) {
+function OverviewSection({ r }) {
   const ov = r.overview||{};
-  const set = (field, value) => onChange(d => { d.overview = d.overview || {}; d.overview[field] = value; });
-  const setTicker = (field, value) => onChange(d => {
-    d.overview = d.overview || {};
-    const current = d.overview.ticker || { symbol: "", exchange: "" };
-    const updated = { ...current, [field]: value };
-    // Revert to null (i.e. "Private") once both symbol and exchange are cleared,
-    // rather than leaving a hollow {symbol:"", exchange:""} object behind.
-    d.overview.ticker = (updated.symbol || updated.exchange) ? updated : null;
-  });
   return (
     <div style={{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:16}}>
       <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
         <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>Company details</p>
-        <Field label="Legal name"  value={ov.legal_name}        editable={editable} onChange={v=>set('legal_name',v)}/>
-        <Field label="DBA"         value={ov.doing_business_as} editable={editable} onChange={v=>set('doing_business_as',v)}/>
-        {editable ? (
-          <>
-            <Field label="Ticker symbol"   value={ov.ticker?.symbol||""}   editable onChange={v=>setTicker('symbol',v)} mono/>
-            <Field label="Ticker exchange" value={ov.ticker?.exchange||""} editable onChange={v=>setTicker('exchange',v)} mono/>
-          </>
-        ) : (
-          <FieldRow label="Ticker"      value={ov.ticker?`${ov.ticker.symbol}:${ov.ticker.exchange}`:(r.ticker||"Private")} mono/>
-        )}
-        <Field label="Ownership"   value={ov.ownership_type} editable={editable} type="select"
-          options={["public","private","subsidiary","jv","government"]} onChange={v=>set('ownership_type',v)}/>
-        <Field label="Parent"     value={ov.parent_company} editable={editable} onChange={v=>set('parent_company',v)}/>
-        <Field label="Founded"    value={ov.founded_year}   editable={editable} type="number" onChange={v=>set('founded_year',v)}/>
-        {editable ? (
-          <Field label="Employees" value={ov.employee_count?.value} type="number" editable
-            onChange={v=>set('employee_count', v==null?null:{...(ov.employee_count||{approximate:true}), value:v})}/>
-        ) : (
-          <FieldRow label="Employees" value={ov.employee_count?`~${Number(ov.employee_count.value).toLocaleString()}`:null}/>
-        )}
+        <FieldRow label="Legal name"  value={ov.legal_name}/>
+        <FieldRow label="DBA"         value={ov.doing_business_as}/>
+        <FieldRow label="Ticker"      value={ov.ticker?`${ov.ticker.symbol}:${ov.ticker.exchange}`:(r.ticker||"Private")} mono/>
+        <FieldRow label="Ownership"   value={ov.ownership_type}/>
+        <FieldRow label="Parent"      value={ov.parent_company}/>
+        <FieldRow label="Founded"     value={ov.founded_year}/>
+        <FieldRow label="Employees"   value={ov.employee_count?`~${Number(ov.employee_count.value).toLocaleString()}`:null}/>
         <FieldRow label="Domain"      value={r.domain||null} mono/>
         <FieldRow label="Website"     value={ov.website} mono/>
       </div>
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
         <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
           <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>Summary</p>
-          {editable ? (
-            <textarea value={ov.summary||""} onChange={e=>set('summary',e.target.value)} style={{width:"100%",minHeight:90}}/>
-          ) : (
-            <p style={{fontSize:13,lineHeight:1.65,color:"var(--text-primary)",margin:0}}>{ov.summary||"—"}</p>
-          )}
+          <p style={{fontSize:13,lineHeight:1.65,color:"var(--text-primary)",margin:0}}>{ov.summary||"—"}</p>
         </div>
         <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
           <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>Industry</p>
-          {editable ? (
-            <input value={(ov.industry_verticals||[]).join(", ")} placeholder="Comma-separated, e.g. semiconductors, IDM"
-              onChange={e=>set('industry_verticals', e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
-              style={{width:"100%",marginBottom:12}}/>
-          ) : (
-            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
-              {(ov.industry_verticals||[]).map(v=><Badge key={v}>{v}</Badge>)}
-              {!(ov.industry_verticals||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
-            </div>
-          )}
-          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8,marginTop:editable?10:0}}>Key competitors</p>
-          {editable ? (
-            <input value={(ov.competitors||[]).join(", ")} placeholder="Comma-separated"
-              onChange={e=>set('competitors', e.target.value.split(",").map(s=>s.trim()).filter(Boolean))}
-              style={{width:"100%"}}/>
-          ) : (
-            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
-              {(ov.competitors||[]).map(c=><Badge key={c}>{c}</Badge>)}
-              {!(ov.competitors||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
-            </div>
-          )}
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+            {(ov.industry_verticals||[]).map(v=><Badge key={v}>{v}</Badge>)}
+            {!(ov.industry_verticals||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
+          </div>
+          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>Key competitors</p>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+            {(ov.competitors||[]).map(c=><Badge key={c}>{c}</Badge>)}
+            {!(ov.competitors||[]).length && <span style={{fontSize:13,color:"var(--text-muted)"}}>—</span>}
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-function LocationsSection({ r, editable, onChange }) {
+function LocationsSection({ r }) {
   const typeMeta = {
     hq:           {bg:"var(--bg-pro)",    color:"var(--text-pro)"},
     fab:          {bg:"var(--bg-danger)", color:"var(--text-danger)"},
@@ -726,44 +882,7 @@ function LocationsSection({ r, editable, onChange }) {
     planned:            {bg:"var(--bg-neutral)", color:"var(--text-secondary)"},
     closed:             {bg:"var(--surface-1)",  color:"var(--text-muted)"},
   };
-  const locationTypes = ["hq","regional_hq","fab","assembly","rd_center","design_center","sales_office","warehouse"];
-  const statusOptions = ["active","ramping","under_construction","planned","closed"];
   const locs = r.locations||[];
-
-  const setField = (i, field, value) => onChange(d => { d.locations[i][field] = value; });
-  const removeAt = (i) => onChange(d => { d.locations.splice(i,1); });
-  const addLocation = () => onChange(d => {
-    d.locations = d.locations || [];
-    d.locations.push({ type:"sales_office", city:"New city", country:"", status:"active", notes:null });
-  });
-
-  if (editable) {
-    return (
-      <div style={{display:"flex",flexDirection:"column",gap:10}}>
-        {locs.map((loc,i) => (
-          <div key={i} style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"0.85rem 1rem"}}>
-            <div style={{display:"flex",justifyContent:"flex-end",marginBottom:6}}>
-              <RemoveRowButton onClick={()=>removeAt(i)} title="Remove this location"/>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-              <Field label="Type" value={loc.type} editable type="select" options={locationTypes} onChange={v=>setField(i,'type',v)}/>
-              <Field label="Status" value={loc.status} editable type="select" options={statusOptions} onChange={v=>setField(i,'status',v)}/>
-              <Field label="City" value={loc.city} editable onChange={v=>setField(i,'city',v)}/>
-              <Field label="Country" value={loc.country} editable onChange={v=>setField(i,'country',v)}/>
-              <Field label="Name" value={loc.name} editable onChange={v=>setField(i,'name',v)}/>
-              <Field label="State / region" value={loc.state_region} editable onChange={v=>setField(i,'state_region',v)}/>
-            </div>
-            <div style={{marginTop:8}}>
-              <label style={{display:"block",fontSize:11,color:"var(--text-muted)",marginBottom:4}}>Notes</label>
-              <input value={loc.notes||""} onChange={e=>setField(i,'notes',e.target.value)} style={{width:"100%"}}/>
-            </div>
-          </div>
-        ))}
-        <AddRowButton onClick={addLocation} label="Add location"/>
-      </div>
-    );
-  }
-
   return (
     <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,overflow:"hidden"}}>
       {locs.map((loc,i) => {
@@ -785,44 +904,9 @@ function LocationsSection({ r, editable, onChange }) {
   );
 }
 
-function StakeholdersSection({ r, editable, onChange }) {
+function StakeholdersSection({ r }) {
   const roleColor = {economic_buyer:"var(--bg-danger)",technical_buyer:"var(--bg-accent)",executive_sponsor:"var(--bg-pro)",champion:"var(--bg-success)",influencer:"var(--bg-warning)",gatekeeper:"var(--surface-1)"};
   const roleText  = {economic_buyer:"var(--text-danger)",technical_buyer:"var(--text-accent)",executive_sponsor:"var(--text-pro)",champion:"var(--text-success)",influencer:"var(--text-warning)",gatekeeper:"var(--text-secondary)"};
-  const roleTypes = ["economic_buyer","technical_buyer","executive_sponsor","champion","influencer","gatekeeper"];
-
-  const setField = (i, field, value) => onChange(d => { d.stakeholders[i][field] = value; });
-  const removeAt = (i) => onChange(d => { d.stakeholders.splice(i,1); });
-  const addStakeholder = () => onChange(d => {
-    d.stakeholders = d.stakeholders || [];
-    d.stakeholders.push({ name:"New stakeholder", title:"", role_type:"influencer", influence_score:0.5, notes:null });
-  });
-
-  if (editable) {
-    const stks = r.stakeholders||[];
-    return (
-      <div style={{display:"flex",flexDirection:"column",gap:10}}>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
-          {stks.map((s,i) => (
-            <div key={i} style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem",display:"flex",flexDirection:"column",gap:8}}>
-              <div style={{display:"flex",justifyContent:"flex-end"}}>
-                <RemoveRowButton onClick={()=>removeAt(i)} title="Remove this stakeholder"/>
-              </div>
-              <Field label="Name" value={s.name} editable onChange={v=>setField(i,'name',v)}/>
-              <Field label="Title" value={s.title} editable onChange={v=>setField(i,'title',v)}/>
-              <Field label="Department" value={s.department} editable onChange={v=>setField(i,'department',v)}/>
-              <Field label="Location" value={s.location} editable onChange={v=>setField(i,'location',v)}/>
-              <Field label="Role" value={s.role_type} editable type="select" options={roleTypes} onChange={v=>setField(i,'role_type',v)}/>
-              <Field label="Influence (0.0–1.0)" value={s.influence_score} editable type="number"
-                onChange={v=>setField(i,'influence_score', v==null?0:Math.max(0,Math.min(1,v)))}/>
-              <Field label="Notes" value={s.notes} editable type="textarea" onChange={v=>setField(i,'notes',v)}/>
-            </div>
-          ))}
-        </div>
-        <AddRowButton onClick={addStakeholder} label="Add stakeholder"/>
-      </div>
-    );
-  }
-
   return (
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>
       {(r.stakeholders||[]).map((s,i) => {
@@ -852,59 +936,10 @@ function StakeholdersSection({ r, editable, onChange }) {
   );
 }
 
-function EconomicsSection({ r, editable, onChange }) {
+function EconomicsSection({ r }) {
   const f    = r.economics?.financials||{};
   const semi = r.economics?.semiconductor_profile||{};
   const segs = r.economics?.revenue_segments||[];
-
-  const setFin  = (field, value) => onChange(d => { d.economics = d.economics||{}; d.economics.financials = {...(d.economics.financials||{}), [field]: value}; });
-  const setSemi = (field, value) => onChange(d => { d.economics = d.economics||{}; d.economics.semiconductor_profile = {...(d.economics.semiconductor_profile||{}), [field]: value}; });
-
-  if (editable) {
-    return (
-      <div style={{display:"flex",flexDirection:"column",gap:16}}>
-        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
-          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>Financials</p>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:0}}>
-            <Field label="Fiscal year"     value={f.fiscal_year}          editable type="number" onChange={v=>setFin('fiscal_year',v)}/>
-            <Field label="Data quality"    value={f.data_quality}         editable type="select" options={["audited","estimated","inferred"]} onChange={v=>setFin('data_quality',v)}/>
-            <Field label="Revenue ($M)"    value={f.revenue_usd_m}        editable type="number" onChange={v=>setFin('revenue_usd_m',v)}/>
-            <Field label="YoY growth (%)"  value={f.revenue_growth_pct}   editable type="number" onChange={v=>setFin('revenue_growth_pct',v)}/>
-            <Field label="Gross margin (%)"value={f.gross_margin_pct}     editable type="number" onChange={v=>setFin('gross_margin_pct',v)}/>
-            <Field label="R&D spend ($M)"  value={f.rd_spend_usd_m}       editable type="number" onChange={v=>setFin('rd_spend_usd_m',v)}/>
-            <Field label="R&D (% of rev)"  value={f.rd_pct_revenue}       editable type="number" onChange={v=>setFin('rd_pct_revenue',v)}/>
-            <Field label="Capex ($M)"      value={f.capex_usd_m}          editable type="number" onChange={v=>setFin('capex_usd_m',v)}/>
-            <Field label="Market cap ($M)" value={f.market_cap_usd_m}     editable type="number" onChange={v=>setFin('market_cap_usd_m',v)}/>
-          </div>
-        </div>
-        {segs.length>0 && (
-          <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
-            <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:4}}>Revenue segments</p>
-            <p style={{fontSize:11,color:"var(--text-muted)",marginBottom:10}}>Not editable yet — edit financials above, or delete and re-run research to regenerate segments.</p>
-            {segs.map((seg,i) => (
-              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 0",borderBottom:i<segs.length-1?"0.5px solid var(--border)":"none",gap:8}}>
-                <span style={{fontSize:13,flex:1,color:"var(--text-muted)"}}>{seg.name}</span>
-                <span style={{fontSize:13,color:"var(--text-muted)"}}>{fmtM(seg.revenue_usd_m)} ({Number(seg.pct_of_total||0).toFixed(0)}%)</span>
-              </div>
-            ))}
-          </div>
-        )}
-        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
-          <p style={{fontSize:12,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>Semiconductor profile</p>
-          <Field label="Buyer type" value={semi.chip_buyer_type} editable type="select"
-            options={["fabless","fab_lite","idc","ems","oem_buyer_only"]} onChange={v=>setSemi('chip_buyer_type',v)}/>
-          <Field label="Has own fab" value={semi.has_own_fab} editable type="checkbox" onChange={v=>setSemi('has_own_fab',v)}/>
-          <Field label="Fab nodes" value={semi.fab_nodes} editable type="list" onChange={v=>setSemi('fab_nodes',v)}/>
-          <Field label="Known suppliers" value={semi.known_chip_suppliers} editable type="list" onChange={v=>setSemi('known_chip_suppliers',v)}/>
-          <Field label="Supply gaps" value={semi.known_supply_gaps} editable type="list" onChange={v=>setSemi('known_supply_gaps',v)}/>
-          <Field label="Est. chip spend ($M)" value={semi.annual_chip_spend_est_usd_m} editable type="number" onChange={v=>setSemi('annual_chip_spend_est_usd_m',v)}/>
-          <Field label="Qualification cycle" value={semi.qualification_cycle} editable type="textarea" onChange={v=>setSemi('qualification_cycle',v)}/>
-          <Field label="Design win notes" value={semi.design_win_notes} editable type="textarea" onChange={v=>setSemi('design_win_notes',v)}/>
-        </div>
-      </div>
-    );
-  }
-
   const metrics = [
     ["Revenue",     fmtM(f.revenue_usd_m),   `FY${f.fiscal_year||"N/A"}`],
     ["YoY growth",  fmtP(f.revenue_growth_pct),""],
@@ -965,49 +1000,9 @@ function EconomicsSection({ r, editable, onChange }) {
   );
 }
 
-function IntelligenceSection({ r, editable, onChange }) {
+function IntelligenceSection({ r }) {
   const intel = r.account_intelligence||{};
   const sigs  = intel.opportunity_signals||[];
-  const statusOptions = ["no_relationship","evaluation","approved_vendor","active_account","strategic_partner"];
-  const sigTypes = ["opportunity","risk","watch"];
-  const urgencyOptions = ["immediate","near_term","long_term"];
-
-  const setIntel = (field, value) => onChange(d => { d.account_intelligence = {...(d.account_intelligence||{}), [field]: value}; });
-  const setSignal = (i, field, value) => onChange(d => { d.account_intelligence.opportunity_signals[i][field] = value; });
-  const removeSignal = (i) => onChange(d => { d.account_intelligence.opportunity_signals.splice(i,1); });
-  const addSignal = () => onChange(d => {
-    d.account_intelligence = d.account_intelligence || {};
-    d.account_intelligence.opportunity_signals = d.account_intelligence.opportunity_signals || [];
-    d.account_intelligence.opportunity_signals.push({ type:"watch", description:"", urgency:"near_term", source:null });
-  });
-
-  if (editable) {
-    return (
-      <div style={{display:"flex",flexDirection:"column",gap:16}}>
-        <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,padding:"1rem 1.25rem"}}>
-          <Field label="Supplier status" value={intel.current_supplier_status} editable type="select" options={statusOptions} onChange={v=>setIntel('current_supplier_status',v)}/>
-          <Field label="Recommended next action" value={intel.recommended_next_action} editable type="textarea" onChange={v=>setIntel('recommended_next_action',v)}/>
-        </div>
-        <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          {sigs.map((sig,i) => (
-            <div key={i} style={{background:sigB(sig.type),border:`0.5px solid ${sigBr(sig.type)}`,borderRadius:12,padding:"0.85rem 1rem"}}>
-              <div style={{display:"flex",justifyContent:"flex-end",marginBottom:6}}>
-                <RemoveRowButton onClick={()=>removeSignal(i)} title="Remove this signal"/>
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:8}}>
-                <Field label="Type" value={sig.type} editable type="select" options={sigTypes} onChange={v=>setSignal(i,'type',v)}/>
-                <Field label="Urgency" value={sig.urgency} editable type="select" options={urgencyOptions} onChange={v=>setSignal(i,'urgency',v)}/>
-              </div>
-              <Field label="Description" value={sig.description} editable type="textarea" onChange={v=>setSignal(i,'description',v)}/>
-              <Field label="Source" value={sig.source} editable onChange={v=>setSignal(i,'source',v)}/>
-            </div>
-          ))}
-          <AddRowButton onClick={addSignal} label="Add signal"/>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
@@ -1066,13 +1061,16 @@ function NewsSection({ r }) {
 }
 
 // ── Sidebar ────────────────────────────────────────────────────
-function Sidebar({ records, activeId, onSelect, onNew, onDelete }) {
+function Sidebar({ records, activeId, onSelect, onNew, onDelete, onOpenSettings }) {
   return (
     <div className="no-print" style={{width:220,flexShrink:0,background:"var(--surface-1)",borderRight:"0.5px solid var(--border)",display:"flex",flexDirection:"column",overflow:"hidden"}}>
       <div style={{padding:"1rem",borderBottom:"0.5px solid var(--border)",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
           <i className="ti ti-radar-2" style={{fontSize:18,color:"var(--text-accent)"}}/>
-          <span style={{fontSize:13,fontWeight:500}}>Account research</span>
+          <span style={{fontSize:13,fontWeight:500,flex:1}}>Account research</span>
+          <button onClick={onOpenSettings} title="Data source settings" style={{fontSize:12,padding:"3px 6px"}}>
+            <i className="ti ti-settings" style={{fontSize:13}}/>
+          </button>
         </div>
         <button onClick={onNew} className="primary" style={{width:"100%",fontSize:13,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
           <i className="ti ti-plus" style={{fontSize:14}}/>New research
@@ -1106,7 +1104,68 @@ function Sidebar({ records, activeId, onSelect, onNew, onDelete }) {
   );
 }
 
-// ── Dashboard ──────────────────────────────────────────────────
+// ── Settings panel (Apollo / PDL keys — stored personally, not shared) ─
+function SettingsPanel({ onClose, onSaved }) {
+  const [apolloKey, setApolloKey] = useState("");
+  const [pdlKey, setPdlKey] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const a = await window.storage.get("settings:apollo_key", false).catch(()=>null);
+        const p = await window.storage.get("settings:pdl_key", false).catch(()=>null);
+        if (a?.value) setApolloKey(a.value);
+        if (p?.value) setPdlKey(p.value);
+      } finally { setLoaded(true); }
+    })();
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      if (apolloKey) await window.storage.set("settings:apollo_key", apolloKey, false);
+      else await window.storage.delete("settings:apollo_key", false).catch(()=>{});
+      if (pdlKey) await window.storage.set("settings:pdl_key", pdlKey, false);
+      else await window.storage.delete("settings:pdl_key", false).catch(()=>{});
+      onSaved(apolloKey, pdlKey);
+      onClose();
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={onClose}>
+      <div style={{background:"var(--surface-2)",border:"0.5px solid var(--border)",borderRadius:12,width:440,padding:"1.25rem"}} onClick={e=>e.stopPropagation()}>
+        <p style={{fontSize:14,fontWeight:500,margin:"0 0 4px"}}>Contact data sources</p>
+        <p style={{fontSize:12,color:"var(--text-muted)",margin:"0 0 16px",lineHeight:1.5}}>
+          Optional. Adds engineers and other individual-contributor contacts alongside the
+          LLM-found executives. Stored only for you (not shared with teammates using this
+          artifact), but calls go directly from your browser to Apollo/PDL — see the note in
+          code comments about CORS and key visibility before relying on this.
+        </p>
+        {!loaded ? <p style={{fontSize:12,color:"var(--text-muted)"}}>Loading…</p> : (
+          <div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:16}}>
+            <div>
+              <label style={{display:"block",fontSize:12,color:"var(--text-secondary)",marginBottom:4}}>Apollo.io API key</label>
+              <input type="password" value={apolloKey} onChange={e=>setApolloKey(e.target.value)} placeholder="Leave blank to disable" style={{width:"100%"}}/>
+            </div>
+            <div>
+              <label style={{display:"block",fontSize:12,color:"var(--text-secondary)",marginBottom:4}}>People Data Labs API key</label>
+              <input type="password" value={pdlKey} onChange={e=>setPdlKey(e.target.value)} placeholder="Leave blank to disable" style={{width:"100%"}}/>
+            </div>
+          </div>
+        )}
+        <div style={{display:"flex",justifyContent:"flex-end",gap:8}}>
+          <button onClick={onClose} style={{fontSize:13}}>Cancel</button>
+          <button onClick={handleSave} disabled={saving} className="primary" style={{fontSize:13}}>{saving?"Saving…":"Save"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function Dashboard({ records, onSelect, onNew, onDelete }) {
   if (!records.length) return (
     <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,padding:"4rem 2rem",textAlign:"center"}}>
@@ -1235,46 +1294,18 @@ function PipelineView({ stageStatuses, currentRecord, log }) {
 }
 
 // ── Results view ───────────────────────────────────────────────
-function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete, onUpdateRecord, onToast }) {
-  const [editMode, setEditMode] = useState(false);
-  const [draft, setDraft] = useState(record);
-
-  // Reset the draft whenever we switch to viewing a different account —
-  // discards any in-progress, un-applied edits.
-  useEffect(() => {
-    setDraft(record);
-    setEditMode(false);
-  }, [record.meta.record_id]);
-
-  const updateDraft = (mutator) => {
-    setDraft(prev => {
-      const next = structuredClone(prev);
-      mutator(next);
-      return next;
-    });
-  };
-
-  const applyEdits = () => {
-    onUpdateRecord(draft);
-    setEditMode(false);
-    onToast("Changes applied — click Save to persist");
-  };
-
-  const cancelEdits = () => {
-    setDraft(record);
-    setEditMode(false);
-  };
-
-  const displayRecord = editMode ? draft : record;
-  const ov   = displayRecord.overview||{};
-  const conf = displayRecord.meta?.confidence||{};
+function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete, onToast, pendingChanges, onDismissChanges }) {
+  const [showChangelog, setShowChangelog] = useState(false);
+  const [showAllChanges, setShowAllChanges] = useState(false);
+  const ov   = record.overview||{};
+  const conf = record.meta?.confidence||{};
   const content = {
-    overview:     <OverviewSection     r={displayRecord} editable={editMode} onChange={updateDraft}/>,
-    locations:    <LocationsSection    r={displayRecord} editable={editMode} onChange={updateDraft}/>,
-    stakeholders: <StakeholdersSection r={displayRecord} editable={editMode} onChange={updateDraft}/>,
-    economics:    <EconomicsSection    r={displayRecord} editable={editMode} onChange={updateDraft}/>,
-    intelligence: <IntelligenceSection r={displayRecord} editable={editMode} onChange={updateDraft}/>,
-    news:         <NewsSection         r={displayRecord}/>,
+    overview:     <OverviewSection     r={record}/>,
+    locations:    <LocationsSection    r={record}/>,
+    stakeholders: <StakeholdersSection r={record}/>,
+    economics:    <EconomicsSection    r={record}/>,
+    intelligence: <IntelligenceSection r={record}/>,
+    news:         <NewsSection         r={record}/>,
   };
   return (
     <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
@@ -1294,43 +1325,31 @@ function ResultsView({ record, activeTab, setActiveTab, onBack, onSave, onDelete
         </div>
         <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",flexShrink:0}}>
           <Badge bg={confB(conf.overall)} color={confC(conf.overall)}>{conf.overall||"medium"} confidence</Badge>
-          {editMode ? (
-            <>
-              <button onClick={applyEdits} className="primary" style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-check" style={{fontSize:13}}/>Apply changes
-              </button>
-              <button onClick={cancelEdits} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-x" style={{fontSize:13}}/>Cancel
-              </button>
-            </>
-          ) : (
-            <>
-              <button onClick={()=>setEditMode(true)} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-pencil" style={{fontSize:13}}/>Edit
-              </button>
-              <button onClick={onSave} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-bookmark" style={{fontSize:13}}/>Save
-              </button>
-              <button onClick={async()=>{await copyToClipboard(toMarkdown(record));onToast("Markdown copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-clipboard" style={{fontSize:13}}/>Copy Markdown
-              </button>
-              <button onClick={async()=>{await copyToClipboard(JSON.stringify(record,null,2));onToast("JSON copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-clipboard-data" style={{fontSize:13}}/>Copy JSON
-              </button>
-              <button onClick={()=>{downloadHtmlReport(record);onToast("Downloaded — open the file, then press Ctrl+P to save as PDF");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
-                <i className="ti ti-download" style={{fontSize:13}}/>Download report
-              </button>
-              <DeleteButton onDelete={()=>onDelete(record.meta.record_id)}/>
-            </>
-          )}
+          <button onClick={onSave} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+            <i className="ti ti-bookmark" style={{fontSize:13}}/>Save
+          </button>
+          <button onClick={async()=>{await copyToClipboard(toMarkdown(record));onToast("Markdown copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+            <i className="ti ti-clipboard" style={{fontSize:13}}/>Copy Markdown
+          </button>
+          <button onClick={async()=>{await copyToClipboard(JSON.stringify(record,null,2));onToast("JSON copied ✓");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+            <i className="ti ti-clipboard-data" style={{fontSize:13}}/>Copy JSON
+          </button>
+          <button onClick={()=>{openPdfReport(record);onToast("PDF opened — use Ctrl+P to save");}} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+            <i className="ti ti-printer" style={{fontSize:13}}/>Save PDF
+          </button>
+          <button onClick={()=>setShowChangelog(true)} style={{fontSize:12,padding:"4px 10px",display:"flex",alignItems:"center",gap:4}}>
+            <i className="ti ti-history" style={{fontSize:13}}/>History
+          </button>
+          <DeleteButton onDelete={()=>onDelete(record.meta.record_id)}/>
         </div>
       </div>
-      {editMode && (
-        <div className="no-print" style={{padding:"8px 1.5rem",background:"var(--bg-accent)",borderBottom:"0.5px solid var(--border-accent)",fontSize:12,color:"var(--text-accent)",flexShrink:0,display:"flex",alignItems:"center",gap:6}}>
-          <i className="ti ti-pencil" style={{fontSize:13}}/>
-          Editing — changes only apply to this record after you click "Apply changes", and only persist to storage after "Save".
-        </div>
-      )}
+      <ChangesBanner
+        changes={pendingChanges}
+        expanded={showAllChanges}
+        onDismiss={onDismissChanges}
+        onViewAll={()=>setShowAllChanges(true)}
+      />
+      {showChangelog && <ChangelogPanel record={record} onClose={()=>setShowChangelog(false)}/>}
       {/* Tabs */}
       <div className="no-print" style={{display:"flex",borderBottom:"0.5px solid var(--border)",padding:"0 1.5rem",flexShrink:0,overflowX:"auto"}}>
         {TABS.map(tab => (
@@ -1362,13 +1381,25 @@ export default function App() {
   const [error,         setError]         = useState(null);
   const [isLoading,     setIsLoading]     = useState(false);
   const [toast,         setToast]         = useState("");
+  const [pendingChanges,setPendingChanges]= useState(null);   // diff vs. last saved version, shown once after a re-run
+  const [apolloKey,     setApolloKey]     = useState("");
+  const [pdlKey,        setPdlKey]        = useState("");
+  const [showSettings,  setShowSettings]  = useState(false);
 
-  // Load saved records from shared storage on mount
+  // Load saved records + contact-data API keys from storage on mount
   useEffect(() => {
     (async () => {
       try {
         const r = await window.storage.get(STORAGE_KEY, true);
         if (r?.value) setRecords(JSON.parse(r.value));
+      } catch {}
+      try {
+        const a = await window.storage.get("settings:apollo_key", false);
+        if (a?.value) setApolloKey(a.value);
+      } catch {}
+      try {
+        const p = await window.storage.get("settings:pdl_key", false);
+        if (p?.value) setPdlKey(p.value);
       } catch {}
     })();
   }, []);
@@ -1429,15 +1460,19 @@ export default function App() {
       addLog(`Economics: ${d.financials?.revenue_usd_m?fmtM(d.financials.revenue_usd_m)+" revenue":"estimates only"} · ${d.financials?.data_quality||"inferred"}`);
     } catch(e) { setStage(1,"error"); addLog(`Economics error: ${e.message}`); }
 
-    // Stage 3 — Stakeholders
+    // Stage 3 — Stakeholders (LLM-found leadership + Apollo/PDL programmatic contacts, run in parallel)
     setStage(2,"running"); addLog("Mapping stakeholders…");
     try {
-      const d = await runStakeholders(form.company);
-      const stks = Array.isArray(d)?d:[];
+      const [d, programmatic] = await Promise.all([
+        runStakeholders(form.company),
+        fetchProgrammaticContacts(form.domain.replace(/^https?:\/\//,""), apolloKey, pdlKey, 20),
+      ]);
+      const llmStks = Array.isArray(d)?d:[];
+      const stks = mergeStakeholderSources(llmStks, programmatic);
       rec = { ...rec, stakeholders:stks };
       rec.meta.confidence.stakeholders = stks.length>=3?"medium":"low";
       setCurrentRecord({...rec}); setStage(2,"done");
-      addLog(`Stakeholders: ${stks.length} decision-makers identified`);
+      addLog(`Stakeholders: ${stks.length} total (${llmStks.length} from web/LLM${programmatic.length?`, ${programmatic.length} from Apollo/PDL`:""})`);
     } catch(e) { setStage(2,"error"); addLog(`Stakeholders error: ${e.message}`); }
 
     // Stage 4 — Intelligence
@@ -1452,6 +1487,12 @@ export default function App() {
       addLog(`Intelligence: ${(d.account_intelligence?.opportunity_signals||[]).length} signals · ${(d.news||[]).length} news items`);
     } catch(e) { setStage(3,"error"); addLog(`Intelligence error: ${e.message}`); }
 
+    // Diff against whatever's currently saved for this company (if anything) —
+    // computed here, before the user saves, so the banner reflects "what's
+    // new in this run" rather than something already persisted.
+    const priorSaved = records.find(r => normKey(r) === normKey(rec)) || null;
+    setPendingChanges(priorSaved ? diffRecords(priorSaved, rec) : null);
+
     addLog("Pipeline complete — review results and save to team.");
     setIsLoading(false); setActiveTab("overview"); setView("results");
   };
@@ -1459,41 +1500,40 @@ export default function App() {
   const handleSave = async () => {
     if (!currentRecord) return;
     const key = normKey(currentRecord);
-    const supersedes = records.some(r => normKey(r) === key && r.meta.record_id !== currentRecord.meta.record_id);
+    const priorSaved = records.find(r => normKey(r) === key && r.meta.record_id !== currentRecord.meta.record_id);
     const updated = [currentRecord, ...records.filter(r => normKey(r) !== key)];
     await persistRecords(updated);
-    showToast(supersedes ? "Updated saved profile ✓" : "Saved to team ✓");
+
+    // Persist a changelog entry so history survives even though only the
+    // latest snapshot per company is kept in `records`.
+    if (priorSaved) {
+      const changes = diffRecords(priorSaved, currentRecord);
+      if (changes.length) {
+        try {
+          const logKey = `changelog:${key}`;
+          const existing = await window.storage.get(logKey, true).catch(()=>null);
+          const log = existing?.value ? JSON.parse(existing.value) : [];
+          log.unshift({ timestamp: new Date().toISOString(), changes });
+          await window.storage.set(logKey, JSON.stringify(log.slice(0,20)), true);
+        } catch {}
+      }
+    }
+
+    showToast(priorSaved ? "Updated saved profile ✓" : "Saved to team ✓");
   };
 
   const handleDelete = async (recordId) => {
+    const target = records.find(r => r.meta.record_id === recordId);
     const updated = records.filter(r => r.meta.record_id !== recordId);
     await persistRecords(updated);
+    if (target) {
+      try { await window.storage.delete(`changelog:${normKey(target)}`, true); } catch {}
+    }
     showToast("Account deleted");
     if (currentRecord?.meta?.record_id === recordId) {
       setCurrentRecord(null);
+      setPendingChanges(null);
       setView("dashboard");
-    }
-  };
-
-  // Commits an edited draft as the in-memory current record. Does NOT
-  // persist to storage — that still requires an explicit "Save" click,
-  // same as a freshly-generated (unsaved) record.
-  const handleUpdateRecord = (updated) => setCurrentRecord(updated);
-
-  // "New research" shouldn't erase visibility into a run that's still
-  // actively executing in the background — clicking it mid-run now shows
-  // the live pipeline progress (stage tracker + log) instead of silently
-  // discarding that view behind a blank form. Once the run finishes,
-  // runPipeline's own completion logic already force-navigates to
-  // "results" regardless of current view, so this only needs to cover
-  // the in-progress window.
-  const handleNewResearchClick = () => {
-    if (isLoading) {
-      setView("pipeline");
-    } else {
-      setView("new");
-      setError(null);
-      setForm({ company: "", domain: "", ticker: "" });
     }
   };
 
@@ -1506,22 +1546,31 @@ export default function App() {
         <Sidebar
           records={records}
           activeId={view==="results"?currentRecord?.meta?.record_id:null}
-          onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setView("results");}}
-          onNew={handleNewResearchClick}
+          onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setPendingChanges(null);setView("results");}}
+          onNew={()=>{setView("new");setError(null);setForm({company:"",domain:"",ticker:""}); }}
           onDelete={handleDelete}
+          onOpenSettings={()=>setShowSettings(true)}
         />
 
+        {showSettings && (
+          <SettingsPanel
+            onClose={()=>setShowSettings(false)}
+            onSaved={(a,p)=>{setApolloKey(a);setPdlKey(p);showToast("Data source settings saved ✓");}}
+          />
+        )}
+
         <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-          {view==="dashboard" && <Dashboard records={records} onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setView("results");}} onNew={handleNewResearchClick} onDelete={handleDelete}/>}
+          {view==="dashboard" && <Dashboard records={records} onSelect={r=>{setCurrentRecord(r);setActiveTab("overview");setPendingChanges(null);setView("results");}} onNew={()=>setView("new")} onDelete={handleDelete}/>}
           {view==="new"       && <NewResearchForm form={form} onChange={setForm} onSubmit={runPipeline} error={error} isLoading={isLoading}/>}
           {view==="pipeline"  && <PipelineView stageStatuses={stageStatuses} currentRecord={currentRecord} log={log}/>}
           {view==="results" && currentRecord && (
             <ResultsView record={currentRecord} activeTab={activeTab} setActiveTab={setActiveTab}
-              onBack={()=>setView("dashboard")}
+              onBack={()=>{setPendingChanges(null);setView("dashboard");}}
               onSave={handleSave}
               onDelete={handleDelete}
-              onUpdateRecord={handleUpdateRecord}
-              onToast={showToast}/>
+              onToast={showToast}
+              pendingChanges={pendingChanges}
+              onDismissChanges={()=>setPendingChanges(null)}/>
           )}
         </div>
 

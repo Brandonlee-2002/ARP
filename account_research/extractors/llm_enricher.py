@@ -1,38 +1,21 @@
 """
 LLM enrichment layer.
 
-Takes raw text chunks from web search + EDGAR (+ optionally verified People
-Data Labs contacts) and uses Claude to extract structured data matching the
-AccountResearchRecord schema.
+Takes raw text chunks from web search + EDGAR and uses Claude to
+extract structured data matching the AccountResearchRecord schema.
 
 Design choices:
 - One LLM call per schema section (not one giant prompt) — keeps context
   focused and makes partial failures recoverable.
 - Each call returns JSON only; we validate with Pydantic before merging.
 - System prompt is minimal; all schema detail goes in the user turn.
-- JSON extraction uses a balanced-bracket scanner (_extract_json), not a
-  plain json.loads() on the raw response — Claude occasionally appends a
-  trailing sentence after the JSON closes (e.g. "I found these on the
-  investor relations page"), which breaks naive parsing. Ported from the
-  identical fix in app.jsx, where this failure mode was first observed.
-- Segment SAM estimation is deliberately split in two: the LLM only ever
-  identifies a vertical + a disclosed unit volume (or returns null rather
-  than inventing one); the dollar math is done in segment_benchmarks.py,
-  never by the model.
-- Grounding checks (extractors/grounding.py) run AFTER the LLM call for the
-  fields most prone to confident fabrication — stakeholder names, disclosed
-  unit volume, and news URLs. Pydantic validates shape; grounding checks
-  are the closest thing this pipeline has to validating truthfulness.
-  IMPORTANT: when verified People Data Labs contacts are supplied, their
-  names are included in the grounding source text — a name the LLM copied
-  correctly from a PDL contact often won't appear anywhere in the raw web
-  snippets, and would otherwise be wrongly treated as fabricated.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -40,70 +23,16 @@ import anthropic
 
 from ..extractors.web_search import SearchResult
 from ..extractors.edgar import EdgarFinancials
-from ..extractors.people_search import PersonProfile
-from ..extractors.patent_search import PatentInventor
-from ..extractors.segment_benchmarks import (
-    BENCHMARKS, guess_vertical, estimate_segment_sam, sic_vertical_hint,
+from ..extractors.grounding import (
+    is_url_grounded,
+    number_grounded,
+    text_contains_claim,
 )
-from ..extractors.grounding import text_contains_claim, number_grounded, is_url_grounded
 
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 4096  # raised from 2048 as a defensive margin against truncation
-                    # on data-heavy responses (many locations/stakeholders)
-
-
-def _extract_json(text: str) -> Optional[str]:
-    """
-    Finds the first complete JSON value (object or array) in `text` by
-    scanning for balanced brackets, correctly skipping over string contents
-    (so braces/brackets inside quoted strings don't throw off the depth
-    count, and escaped quotes don't prematurely end a string). Returns the
-    exact substring for that value — ignoring any leading preamble *and*
-    any trailing prose Claude appended after the JSON closes. Returns None
-    if the brackets never balance (e.g. a genuinely truncated response) —
-    the caller's own json.loads then surfaces that failure normally.
-
-    Ported from the identical `extractJson` in app.jsx.
-    """
-    start = None
-    for i, ch in enumerate(text):
-        if ch in "{[":
-            start = i
-            break
-    if start is None:
-        return None
-
-    open_char = text[start]
-    close_char = "}" if open_char == "{" else "]"
-    depth = 0
-    in_string = False
-    escape_next = False
-
-    for i in range(start, len(text)):
-        ch = text[i]
-
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == "\\" and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-
-        if ch == open_char:
-            depth += 1
-        elif ch == close_char:
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-
-    return None
+MAX_TOKENS = 2048
 
 
 @dataclass
@@ -125,28 +54,19 @@ class LLMEnricher:
         domain: str,
         search_results: list[SearchResult],
         edgar_data: Optional[EdgarFinancials] = None,
-        pdl_contacts: Optional[list[PersonProfile]] = None,
-        patent_inventors: Optional[list[PatentInventor]] = None,
+        programmatic_contacts: Optional[list[dict]] = None,
     ) -> dict[str, Any]:
         """
         Returns a dict with keys matching AccountResearchRecord sections.
         Each section is independently extracted; failures return {} for
         that section so the rest of the record still populates.
 
-        pdl_contacts: verified People Data Labs contacts (optional). When
-        present, they anchor the stakeholder-extraction prompt so Claude
-        uses real names/titles instead of inferring purely from search
-        snippets. Assembler.py does the actual name-matching + verified
-        flag + safety-net merge; this method only makes the LLM aware of
-        them as candidates.
-
-        patent_inventors: PatentInventor objects from extractors/
-        patent_search.py (optional). Also anchor the stakeholder prompt as
-        candidates, but with a DIFFERENT caveat than PDL — a patent proves
-        someone invented something at some point, not that they still
-        work there. The prompt below reflects that distinction, and
-        assembler.py never adds an unmatched patent inventor as a new
-        stakeholder record the way it does for unmatched PDL contacts.
+        `programmatic_contacts` is the Apollo/PDL contact list (stage 2b
+        of the pipeline, Stakeholder-shaped dicts from
+        `people_data._to_stakeholder_dict()`). It is a grounding source in
+        its own right: a real contact the LLM correctly surfaced has no
+        web-snippet backing, and checking snippets alone would get it
+        discarded as "ungrounded".
         """
         # Group search snippets by topic for targeted prompts
         by_topic = self._group_by_topic(search_results)
@@ -157,26 +77,27 @@ class LLMEnricher:
 
         sections["overview"]      = self._extract_overview(company_name, domain, by_topic)
         sections["locations"]     = self._extract_locations(company_name, by_topic)
-        sections["stakeholders"]  = self._extract_stakeholders(
-            company_name, by_topic, pdl_contacts, patent_inventors
-        )
-        sections["economics"]     = self._extract_economics(company_name, by_topic, edgar_data)
 
-        # Segment SAM depends on overview (business description) and
-        # economics (audited revenue, if any) already being extracted,
-        # so it runs after both and merges into the economics section.
-        # edgar_data is passed through here for its sic/sic_description
-        # fields — an audited anchor fact for the vertical classification,
-        # not a substitute for the LLM's own judgment (see
-        # segment_benchmarks.py's SIC_VERTICAL_HINTS docstring for why).
-        sections["economics"]["segment_sam_estimates"] = self._extract_segment_sam(
-            company_name, sections["overview"], by_topic, edgar_data
+        stakeholders = self._extract_stakeholders(company_name, by_topic)
+        sections["stakeholders"] = self._ground_stakeholders(
+            stakeholders,
+            by_topic.get("stakeholders", ""),
+            programmatic_contacts or [],
         )
+
+        economics = self._extract_economics(company_name, by_topic, edgar_data)
+        econ_source_text = "\n".join(
+            [by_topic.get("financials", ""), by_topic.get("semi_profile", "")]
+        )
+        sections["economics"] = self._ground_economics(economics, econ_source_text, edgar_data)
 
         sections["account_intelligence"] = self._extract_account_intelligence(
             company_name, raw_text_all
         )
-        sections["news"]          = self._extract_news(company_name, by_topic, search_results)
+
+        news_items = self._extract_news(company_name, by_topic)
+        news_results = [r for r in search_results if r.topic == "news"]
+        sections["news"] = self._ground_news(news_items, news_results)
 
         return sections
 
@@ -240,72 +161,18 @@ Put HQ first. Include at most 12 locations.
         result = self._call(prompt, section="locations", expect_list=True)
         return result if isinstance(result, list) else []
 
-    def _extract_stakeholders(
-        self,
-        company_name: str,
-        by_topic: dict[str, str],
-        pdl_contacts: Optional[list[PersonProfile]] = None,
-        patent_inventors: Optional[list[PatentInventor]] = None,
-    ) -> list:
-        source_text = by_topic.get("stakeholders", "")
-        pdl_contacts = pdl_contacts or []
-        patent_inventors = patent_inventors or []
-
-        pdl_block = ""
-        pdl_names_text = ""
-        if pdl_contacts:
-            lines = []
-            for c in pdl_contacts:
-                if not c.name:
-                    continue
-                bits = [c.name]
-                if c.title:
-                    bits.append(f"— {c.title}")
-                if c.department:
-                    bits.append(f"({c.department})")
-                lines.append(" ".join(bits))
-            pdl_names_text = "\n".join(f"[{c.name}]" for c in pdl_contacts if c.name)
-            pdl_block = f"""
-KNOWN VERIFIED CONTACTS (from a structured people-search source — these are
-REAL, confirmed people currently at this company; prefer using their exact
-name and title over inferring a different person for the same role):
-{chr(10).join(lines)}
-"""
-
-        # Patent inventors get a DIFFERENT framing than PDL contacts — a
-        # patent proves someone invented something at some point, not that
-        # they still work here. The model is told not to assume current
-        # employment or a specific title from this list alone.
-        patent_block = ""
-        patent_names_text = ""
-        if patent_inventors:
-            lines = []
-            for inv in patent_inventors[:15]:  # cap — some companies have hundreds
-                if not inv.name:
-                    continue
-                segs = ", ".join(sorted(inv.segments)) if inv.segments else None
-                bits = [inv.name, f"— {inv.patent_count} granted patent(s)"]
-                if segs:
-                    bits.append(f"(segments: {segs})")
-                if inv.most_recent_grant:
-                    bits.append(f"most recent grant: {inv.most_recent_grant}")
-                lines.append(" ".join(bits))
-            patent_names_text = "\n".join(f"[{inv.name}]" for inv in patent_inventors if inv.name)
-            patent_block = f"""
-KNOWN PATENT INVENTORS (real people who have been granted patents assigned to
-this company — NOT confirmed current employees; a patent can be years old.
-Only use one of these as a stakeholder if the source text ALSO corroborates
-they currently work here — otherwise leave them out rather than assuming an
-active role from patent data alone):
-{chr(10).join(lines)}
-"""
-
+    def _extract_stakeholders(self, company_name: str, by_topic: dict[str, str]) -> list:
         prompt = f"""
 Extract key stakeholders and decision-makers for "{company_name}" who would be
-relevant to a semiconductor supplier's account manager.
-{pdl_block}{patent_block}
+relevant to a semiconductor supplier's account manager. Include a mix of
+leadership AND individual-contributor engineers — do not limit yourself to
+executives who'd appear in press coverage; the source text below includes
+engineering-focused search results specifically so you can surface working
+engineers (process, device, test, validation, applications, etc.), not just
+the CEO/CTO.
+
 SOURCE TEXT:
-{source_text or "(no stakeholder snippets found)"}
+{by_topic.get("stakeholders", "(no stakeholder snippets found)")}
 
 Return a JSON array. Each person must have EXACTLY these fields:
 {{
@@ -325,45 +192,19 @@ Return a JSON array. Each person must have EXACTLY these fields:
 
 Role guidance for semiconductor sales:
 - economic_buyer: owns budget/contracts (procurement VP, CPO)
-- technical_buyer: evaluates specs (chip architect, principal engineer)
+- technical_buyer: evaluates specs (chip architect, principal engineer, staff engineer, process/device/test engineer)
 - executive_sponsor: approves strategic supplier list (CTO, CSO)
 - gatekeeper: controls vendor qualification process
 
-Include 4-8 people. Set influence_score based on role (economic_buyer 0.8-1.0,
-technical_buyer 0.6-0.8, executive_sponsor 0.5-0.7, others 0.3-0.6).
-
-IMPORTANT — do not fabricate names. If a KNOWN VERIFIED CONTACT above fits a
-relevant role, use their exact name and title. A KNOWN PATENT INVENTOR may
-only be used if the source text corroborates current employment — do not
-promote a patent inventor to a stakeholder based on the patent list alone.
-For any other role, only use a real person's name if it literally appears in
-the source text. If you cannot find a real name for a role you believe
-exists, use the role title itself as the "name" field instead — e.g. "VP of
-Procurement (name not found)" — rather than inventing a plausible-sounding
-person. A made-up name is worse than an honest placeholder.
+Include up to 15 people if the source text supports it — don't pad with
+invented names, but don't stop at the first handful either. Aim for roughly
+two-thirds technical_buyer (engineers) and one-third leadership/procurement,
+matching the mix a real account manager would build. Set influence_score based
+on role (economic_buyer 0.8-1.0, technical_buyer 0.4-0.7, executive_sponsor
+0.5-0.7, others 0.3-0.6).
 """
         result = self._call(prompt, section="stakeholders", expect_list=True)
-        result = result if isinstance(result, list) else []
-
-        # Grounding pass: re-check every name against source text OR the
-        # verified PDL/patent lists. A name that only appears in one of
-        # those (not in the raw web snippets) is still genuinely grounded —
-        # it's sourced from a structured data provider, just not from text
-        # the model was quoting. Without including these here, a correctly
-        # anchored name would be wrongly treated as invented.
-        grounding_source = f"{source_text}\n{pdl_names_text}\n{patent_names_text}"
-        for item in result:
-            name  = item.get("name", "") or ""
-            title = item.get("title", "") or "Unknown role"
-            if "(name not found)" in name.lower():
-                continue  # model already self-flagged, nothing to check
-            if not text_contains_claim(name, grounding_source):
-                logger.info(
-                    "[llm] stakeholders → ungrounded name '%s' replaced with role placeholder", name
-                )
-                item["name"] = f"{title} (name not found)"
-
-        return result
+        return result if isinstance(result, list) else []
 
     def _extract_economics(
         self,
@@ -434,138 +275,6 @@ Mark data_quality as "audited" only if from SEC filing.
 """
         return self._call(prompt, section="economics")
 
-    def _extract_segment_sam(
-        self,
-        company_name: str,
-        overview: dict,
-        by_topic: dict[str, str],
-        edgar: Optional[EdgarFinancials] = None,
-    ) -> list[dict]:
-        """
-        Two-step estimate of Power / EP / HPC / CONN / AMS SAM for this
-        account:
-
-          1. This method's LLM call ONLY identifies which benchmarked
-             vertical fits the account and whether the source text
-             discloses an annual unit volume. It is explicitly told to
-             return null rather than invent a number. When available,
-             SEC's own SIC classification (audited, structured — not an
-             LLM guess) is given to the model as an anchor fact via
-             segment_benchmarks.sic_vertical_hint(), narrowing the likely
-             candidates without dictating the answer — SIC codes are
-             coarser than our vertical taxonomy (can't distinguish EV vs
-             ICE, or AI vs general-purpose servers), so this informs the
-             model's judgment rather than replacing it.
-          2. A grounding check re-verifies that any returned unit volume
-             actually appears in the source text — the LLM can comply
-             with the "don't fabricate" instruction in spirit but still
-             be wrong in practice, so this is checked rather than trusted.
-          3. segment_benchmarks.estimate_segment_sam() does the actual
-             dollar math in plain Python — no LLM arithmetic involved.
-
-        Always returns 5 entries (see estimate_segment_sam docstring) so
-        the record is uniform whether or not we could compute a number.
-        """
-        vertical_options = ", ".join(f'"{k}"' for k in BENCHMARKS.keys())
-        summary = overview.get("summary", "") or ""
-        verticals = overview.get("industry_verticals", []) or []
-        combined_source = f"{by_topic.get('overview', '')}\n{by_topic.get('financials', '')}"
-
-        sic_code = edgar.sic if edgar else None
-        sic_description = edgar.sic_description if edgar else None
-        hint = sic_vertical_hint(sic_code)
-
-        sic_block = ""
-        if sic_description:
-            if hint:
-                sic_block = f"""
-SEC FILER CLASSIFICATION (audited, structured fact from EDGAR — not a guess):
-SIC code {sic_code} ("{sic_description}"). Companies with this SIC code are
-usually one of: {", ".join(hint["candidates"])}. Use the source text below
-to decide which of these (if any) actually fits — SIC classification is too
-coarse to make this call by itself (e.g. it cannot distinguish an EV
-automaker from an ICE one, or an AI server maker from a general-purpose
-one), so don't treat this as the final answer on its own.
-"""
-            else:
-                sic_block = f"""
-SEC FILER CLASSIFICATION (audited, structured fact from EDGAR — not a guess):
-SIC code {sic_code} ("{sic_description}"). Not pre-mapped to any of the
-listed verticals below — use your own judgment on whether it's relevant.
-"""
-
-        prompt = f"""
-Identify which semiconductor end-market vertical best fits "{company_name}"
-as a customer/OEM (not as a chip supplier), and find their most recent
-disclosed annual unit volume, if any.
-{sic_block}
-COMPANY SUMMARY:
-{summary}
-Industry verticals (as already extracted): {", ".join(verticals) or "(none extracted)"}
-
-SOURCE TEXT:
-{combined_source}
-
-Return a JSON object with EXACTLY these fields:
-{{
-  "vertical_key": one of [{vertical_options}] | null,
-  "vertical_confidence": "high" | "medium" | "low",
-  "annual_unit_volume": integer | null,
-  "unit_type": string | null,
-  "volume_source": string | null,
-  "reasoning": "1-2 sentences explaining the vertical match and, if applicable, where the unit volume came from"
-}}
-
-Rules:
-- vertical_key MUST be null if none of the listed options clearly fits this
-  account's actual product/business — do not force a match onto the
-  closest-sounding option, even if a SIC hint above suggests a candidate.
-- annual_unit_volume MUST be null unless the source text discloses or very
-  strongly implies a specific figure (e.g. "vehicles produced last year",
-  "base stations deployed", "servers shipped"). Never estimate, infer from
-  revenue, or fabricate a volume — null is the correct answer far more
-  often than a real number.
-"""
-        classification = self._call(prompt, section="segment_sam_classification")
-        if not isinstance(classification, dict):
-            classification = {}
-
-        vertical_key = classification.get("vertical_key")
-        if not vertical_key or vertical_key not in BENCHMARKS:
-            # Fallback order when the LLM returns null:
-            #   1. SIC hint, but ONLY if it unambiguously implies exactly
-            #      one candidate — an ambiguous SIC hint (e.g. "could be
-            #      auto_ice or auto_ev") isn't a safe deterministic
-            #      fallback, since picking either half of an ambiguous
-            #      pair is just as likely to be wrong as guessing blind.
-            #   2. The cheap keyword guess, same as before SIC existed.
-            if hint and len(hint["candidates"]) == 1:
-                vertical_key = hint["candidates"][0]
-            else:
-                vertical_key = guess_vertical(verticals, summary)
-
-        unit_volume = classification.get("annual_unit_volume")
-        reasoning   = classification.get("reasoning")
-
-        # Grounding check: the model was told not to fabricate a volume,
-        # but "told not to" isn't "verified not to." Discard silently
-        # rather than pass an ungrounded number into the SAM math — an
-        # ungrounded volume is worse than no volume at all, since it would
-        # otherwise produce a confident-looking dollar estimate.
-        if unit_volume is not None and not number_grounded(unit_volume, combined_source):
-            logger.info(
-                "[llm] segment_sam → ungrounded unit_volume %s discarded for %s",
-                unit_volume, company_name,
-            )
-            unit_volume = None
-            reasoning = (reasoning or "") + " (disclosed unit volume could not be verified in source text; discarded.)"
-
-        return estimate_segment_sam(
-            vertical_key=vertical_key,
-            unit_volume=unit_volume,
-            reasoning=reasoning,
-        )
-
     def _extract_account_intelligence(self, company_name: str, raw_text: str) -> dict:
         prompt = f"""
 You are advising a semiconductor company's account manager researching "{company_name}".
@@ -596,12 +305,7 @@ Include 2-5 signals. Focus on:
 """
         return self._call(prompt, section="account_intelligence")
 
-    def _extract_news(
-        self,
-        company_name: str,
-        by_topic: dict[str, str],
-        search_results: list[SearchResult],
-    ) -> list:
+    def _extract_news(self, company_name: str, by_topic: dict[str, str]) -> list:
         prompt = f"""
 Extract recent news items about "{company_name}" relevant to a semiconductor supplier.
 
@@ -620,29 +324,142 @@ Return a JSON array. Each item must have EXACTLY these fields:
 
 Include at most 8 items. Sort newest first. Prioritize news about:
 fab investments, chip sourcing, earnings, leadership changes, partnerships.
-
-IMPORTANT — only report items whose URL appears in the source text above.
-Do not invent a headline, source, or URL that isn't backed by the source
-text, even if it sounds plausible.
 """
         result = self._call(prompt, section="news", expect_list=True)
-        result = result if isinstance(result, list) else []
+        return result if isinstance(result, list) else []
 
-        # Grounding pass: cross-check each item's URL against the URLs
-        # actually returned by the "news" search queries. An item whose
-        # URL doesn't match anything we actually retrieved is dropped
-        # outright rather than kept with a caveat — an invented news
-        # citation is a worse outcome than a shorter, all-real news list.
-        known_urls = {r.url for r in search_results if r.topic == "news" and r.url}
-        grounded = []
-        for item in result:
-            url = item.get("url", "") or ""
-            if known_urls and not is_url_grounded(url, known_urls):
-                logger.info("[llm] news → ungrounded URL dropped: %s", url)
+    # ------------------------------------------------------------------
+    # Grounding — catches invented names, figures, and URLs that are
+    # schema-valid but never actually appeared in retrieved text. See
+    # ../extractors/grounding.py for the underlying checks; this is just
+    # the wiring: which value gets checked against which source, and
+    # what happens on failure (placeholder, drop, or null — never a
+    # silent keep).
+    # ------------------------------------------------------------------
+
+    # Financials fields the LLM prompt explicitly hands EDGAR's audited
+    # numbers for (see the `edgar_block` in `_extract_economics`). Those
+    # numbers legitimately won't appear in the web-search source text, and
+    # get overridden again by the audited EDGAR figures later in
+    # `assembler._build_economics` — so they must never be nulled here.
+    _EDGAR_SOURCED_FINANCIAL_FIELDS = frozenset({
+        "revenue_usd_m", "net_income_usd_m", "rd_spend_usd_m",
+        "capex_usd_m", "gross_margin_pct",
+    })
+
+    # All numeric financials fields eligible for grounding (superset of
+    # the EDGAR-sourced ones above).
+    _ECONOMICS_NUMERIC_FIELDS = (
+        "revenue_usd_m", "revenue_growth_pct", "gross_margin_pct",
+        "operating_margin_pct", "net_income_usd_m", "rd_spend_usd_m",
+        "rd_pct_revenue", "capex_usd_m", "market_cap_usd_m",
+    )
+
+    @staticmethod
+    def _normalize_name(name: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+    def _ground_stakeholders(
+        self,
+        stakeholders: list,
+        source_text: str,
+        programmatic_contacts: list[dict],
+    ) -> list[dict]:
+        """
+        A stakeholder name is grounded if it appears in the stakeholder
+        snippets OR matches a programmatic (Apollo/PDL) contact name —
+        the contact list counts as a grounding source in its own right so
+        a real contact never gets destroyed for lacking snippet backing.
+        Ungrounded names are replaced with a role-title placeholder, never
+        dropped — the stakeholder (title, role_type, notes) still holds
+        useful signal even if the name doesn't check out.
+        """
+        contact_names = {
+            self._normalize_name(c.get("name"))
+            for c in programmatic_contacts
+            if isinstance(c, dict) and c.get("name")
+        }
+
+        grounded: list[dict] = []
+        for item in stakeholders:
+            if not isinstance(item, dict):
                 continue
-            grounded.append(item)
+            name = item.get("name") or ""
+            if self._normalize_name(name) in contact_names or text_contains_claim(name, source_text):
+                grounded.append(item)
+                continue
 
+            item = dict(item)
+            title = item.get("title") or "Stakeholder"
+            item["name"] = f"{title} (name not found)"
+            logger.info(
+                "[grounding] stakeholder name %r ungrounded — replaced with placeholder %r",
+                name, item["name"],
+            )
+            grounded.append(item)
         return grounded
+
+    def _ground_news(
+        self,
+        news_items: list,
+        news_results: list[SearchResult],
+    ) -> list[dict]:
+        """
+        A news item's URL is grounded only if it matches a URL actually
+        returned by that run's news-topic search results. Ungrounded
+        items are dropped outright — an invented citation has no salvage
+        value the way an invented name does.
+        """
+        known_urls = {r.url for r in news_results if r.url}
+
+        kept: list[dict] = []
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url") or ""
+            if is_url_grounded(url, known_urls):
+                kept.append(item)
+            else:
+                logger.info(
+                    "[grounding] news item dropped — url not returned by search: %r (%r)",
+                    item.get("headline"), url,
+                )
+        return kept
+
+    def _ground_economics(
+        self,
+        economics: Any,
+        source_text: str,
+        edgar: Optional[EdgarFinancials],
+    ) -> Any:
+        """
+        Nulls any economics.financials numeric figure that doesn't appear
+        in the economics-topic source text — except the fields the model
+        was explicitly handed EDGAR's audited numbers for, which are
+        exempt whenever EDGAR data was available for this run (see
+        `_EDGAR_SOURCED_FINANCIAL_FIELDS`).
+        """
+        if not isinstance(economics, dict):
+            return economics
+        financials = economics.get("financials")
+        if not isinstance(financials, dict):
+            return economics
+
+        for field_name in self._ECONOMICS_NUMERIC_FIELDS:
+            if edgar is not None and field_name in self._EDGAR_SOURCED_FINANCIAL_FIELDS:
+                continue
+            value = financials.get(field_name)
+            if value is None:
+                continue
+            if not number_grounded(value, source_text):
+                logger.info(
+                    "[grounding] economics.financials.%s=%s ungrounded — set to null",
+                    field_name, value,
+                )
+                financials[field_name] = None
+
+        economics["financials"] = financials
+        return economics
 
     # ------------------------------------------------------------------
     # LLM call wrapper
@@ -662,9 +479,7 @@ text, even if it sounds plausible.
             "You are a structured data extractor for a B2B semiconductor sales intelligence system. "
             "Respond ONLY with valid JSON — no markdown, no prose, no code fences. "
             "If information is unavailable, use null for optional fields. "
-            "Never fabricate specific numbers, names, or citations — use null "
-            "or an explicit placeholder instead. An honest gap is always "
-            "preferable to a plausible-sounding invention."
+            "Never fabricate specific numbers — use null instead."
         )
         try:
             response = self.client.messages.create(
@@ -675,14 +490,13 @@ text, even if it sounds plausible.
             )
             raw = response.content[0].text.strip()
 
-            # Strip accidental markdown fences before hunting for JSON
+            # Strip accidental markdown fences
             if raw.startswith("```"):
-                raw = raw.split("```", 2)[1]
+                raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
 
-            extracted = _extract_json(raw)
-            parsed = json.loads(extracted if extracted is not None else raw)
+            parsed = json.loads(raw)
             logger.info("[llm] %s → ok", section)
             return parsed
 
@@ -701,7 +515,11 @@ text, even if it sounds plausible.
     def _group_by_topic(results: list[SearchResult]) -> dict[str, str]:
         """
         Collapses search results into one text block per topic.
-        Keeps the top-5 snippets per topic to stay within token budget.
+        Keeps the top-N snippets per topic to stay within token budget —
+        stakeholders gets a higher cap since it now runs more queries
+        (leadership + engineering-specific) and needs enough raw material
+        for the LLM to actually find 15+ people rather than just the same
+        handful of execs every other topic would surface.
         """
         grouped: dict[str, list[str]] = {}
         for r in results:
@@ -709,8 +527,9 @@ text, even if it sounds plausible.
             grouped[r.topic].append(
                 f"[{r.title}] ({r.url})\n{r.snippet}"
             )
+        topic_caps = {"stakeholders": 20}
         return {
-            topic: "\n\n".join(items[:5])
+            topic: "\n\n".join(items[:topic_caps.get(topic, 5)])
             for topic, items in grouped.items()
         }
 

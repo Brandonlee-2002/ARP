@@ -11,7 +11,7 @@ below).
 What this DOES give you:
   - Real names, tied to real technology (CPC classification), tied to a
     real filing/grant date.
-  - A rough segment tag (Power / EP / HPC / CONN / AMS) per patent, via
+  - A rough segment tag (Power / EP / HPC / AMS) per patent, via
     CPC_SEGMENT_MAP below.
   - Inventor city/state, when present — a corroborating signal for
     design-center location, especially when cross-referenced against
@@ -100,15 +100,21 @@ USPTO_API_BASE = "https://api.uspto.gov"
 SEARCH_ENDPOINT = f"{USPTO_API_BASE}/api/v1/patent/applications/search"
 
 # ---------------------------------------------------------------------------
-# CPC classification → our five segments.
+# CPC classification → Renesas's four canonical product groups.
 #
 # This is a STARTING heuristic, not an authoritative technical taxonomy —
-# CPC codes are far more granular than five buckets, many patents span
+# CPC codes are far more granular than four buckets, many patents span
 # multiple relevant codes, and some prefixes (e.g. H01L, "semiconductor
 # devices") are too broad to map to one segment confidently, so they're
 # deliberately left unmapped rather than guessed. Extend/refine this with
 # input from someone who actually knows the CPC scheme for your product
 # lines — treat this as a first pass to be corrected, not a finished map.
+#
+# Connectivity-related codes (RF, wireless, antennas) map to "ams", not a
+# separate "conn" bucket — Renesas's own canonical grouping treats
+# connectivity (BLE, low-power Wi-Fi, NFC) as one family WITHIN
+# "AMS (Analog & Connectivity)", not a fifth top-level group. See
+# schema.py's Segment enum docstring for the full reasoning.
 #
 # Confirmed from a live response (2026-07-22): CPC codes come back with
 # irregular internal whitespace between the class and the group/subgroup —
@@ -129,12 +135,13 @@ CPC_SEGMENT_MAP: dict[str, str] = {
     # High-performance compute: general computing, AI/ML accelerators
     "G06N": "hpc",      # computing arrangements based on specific computational models
     "G06F15": "hpc",    # digital computers / data processing (large-scale)
-    # Connectivity: RF, wireless, networking, antennas
-    "H04B": "conn",     # transmission systems
-    "H04W": "conn",     # wireless communication networks
-    "H04L": "conn",     # transmission of digital information
-    "H01Q": "conn",     # antennas
-    # Analog & mixed-signal: signal processing, converters, RF front-end
+    # AMS (Analog & Connectivity): RF/wireless/antennas, plus signal
+    # processing, converters, RF front-end — all one group per Renesas's
+    # canonical taxonomy, not split into a separate connectivity bucket.
+    "H04B": "ams",     # transmission systems
+    "H04W": "ams",     # wireless communication networks
+    "H04L": "ams",     # transmission of digital information
+    "H01Q": "ams",     # antennas
     "H03F": "ams",      # amplifiers
     "H03M": "ams",       # analog/digital conversion
     "H03K": "ams",       # pulse technique / logic circuits

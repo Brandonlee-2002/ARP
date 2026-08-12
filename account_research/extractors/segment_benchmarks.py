@@ -3,9 +3,10 @@ Semiconductor content benchmarks per customer vertical.
 
 Converts a target account's disclosed annual unit volume (vehicles
 produced, servers shipped, etc. — found in their 10-K / investor
-disclosures) into an ESTIMATED semiconductor SAM, split across the five
+disclosures) into an ESTIMATED semiconductor SAM, split across the four
 product segments: Power, Embedded Processing (EP), High-Performance
-Compute (HPC), Connectivity (CONN), and Analog & Mixed-Signal (AMS).
+Compute (HPC), and Analog & Mixed-Signal (AMS, which also covers
+connectivity — BLE, low-power Wi-Fi, NFC).
 
 Design principle: the LLM only ever identifies (a) which vertical fits the
 account and (b) whether a unit volume is disclosed. The dollar math below
@@ -28,7 +29,7 @@ from typing import Optional
 # Benchmark table
 # ---------------------------------------------------------------------------
 
-SEGMENTS = ["power", "ep", "hpc", "conn", "ams"]
+SEGMENTS = ["power", "ep", "hpc", "ams"]
 
 
 @dataclass
@@ -49,7 +50,7 @@ BENCHMARKS: dict[str, VerticalBenchmark] = {
         vertical="Automotive — ICE / conventional",
         unit_basis="vehicles produced",
         semi_content_usd_low=400, semi_content_usd_high=600,
-        segment_split={"power": 0.20, "ep": 0.30, "hpc": 0.05, "conn": 0.20, "ams": 0.25},
+        segment_split={"power": 0.20, "ep": 0.30, "hpc": 0.05, "ams": 0.45},
         source="AlixPartners, 'Navigating the semiconductor-auto nexus' (2026); "
                "Yole Développement via Electronics360",
         as_of="2026",
@@ -60,7 +61,7 @@ BENCHMARKS: dict[str, VerticalBenchmark] = {
         vertical="Automotive — EV / BEV",
         unit_basis="vehicles produced",
         semi_content_usd_low=1200, semi_content_usd_high=2000,
-        segment_split={"power": 0.40, "ep": 0.20, "hpc": 0.10, "conn": 0.15, "ams": 0.15},
+        segment_split={"power": 0.40, "ep": 0.20, "hpc": 0.10, "ams": 0.30},
         source="AlixPartners (2026); IEA Global EV Outlook 2025 via Mordor Intelligence",
         as_of="2026",
         confidence="sourced",
@@ -70,7 +71,7 @@ BENCHMARKS: dict[str, VerticalBenchmark] = {
         vertical="Datacenter / HPC — AI server rack",
         unit_basis="AI server racks deployed (compute-tray content only)",
         semi_content_usd_low=1_500_000, semi_content_usd_high=3_500_000,
-        segment_split={"power": 0.15, "ep": 0.05, "hpc": 0.55, "conn": 0.20, "ams": 0.05},
+        segment_split={"power": 0.15, "ep": 0.05, "hpc": 0.55, "ams": 0.25},
         source="Semiconductor Industry Association / Deloitte, "
                "'Powering AI: The Semiconductor Ecosystem at the Foundation of Data Centers' (June 2026)",
         as_of="2026",
@@ -81,7 +82,7 @@ BENCHMARKS: dict[str, VerticalBenchmark] = {
         vertical="Datacenter — general-purpose server",
         unit_basis="servers shipped",
         semi_content_usd_low=None, semi_content_usd_high=None,
-        segment_split={"power": 0.15, "ep": 0.05, "hpc": 0.45, "conn": 0.25, "ams": 0.10},
+        segment_split={"power": 0.15, "ep": 0.05, "hpc": 0.45, "ams": 0.35},
         source="NEEDS RESEARCH — no sourced $/unit figure yet for non-AI servers",
         as_of="",
         confidence="needs_research",
@@ -91,7 +92,7 @@ BENCHMARKS: dict[str, VerticalBenchmark] = {
         vertical="Telecom infrastructure — base station / RAN",
         unit_basis="base stations / radio units deployed",
         semi_content_usd_low=None, semi_content_usd_high=None,
-        segment_split={"power": 0.15, "ep": 0.15, "hpc": 0.10, "conn": 0.45, "ams": 0.15},
+        segment_split={"power": 0.15, "ep": 0.15, "hpc": 0.10, "ams": 0.60},
         source="NEEDS RESEARCH — pull current Yole / Dell'Oro RAN semiconductor BOM figures",
         as_of="",
         confidence="needs_research",
@@ -101,7 +102,7 @@ BENCHMARKS: dict[str, VerticalBenchmark] = {
         vertical="Industrial — factory automation / robotics",
         unit_basis="units produced (PLC, drive, or robot controller)",
         semi_content_usd_low=None, semi_content_usd_high=None,
-        segment_split={"power": 0.30, "ep": 0.30, "hpc": 0.05, "conn": 0.15, "ams": 0.20},
+        segment_split={"power": 0.30, "ep": 0.30, "hpc": 0.05, "ams": 0.35},
         source="NEEDS RESEARCH — segment split is directional only, not yet benchmark-sourced",
         as_of="",
         confidence="directional",
@@ -211,7 +212,7 @@ def estimate_segment_sam(
     reasoning: Optional[str] = None,
 ) -> list[dict]:
     """
-    Always returns exactly 5 entries (one per segment in SEGMENTS), even
+    Always returns exactly 4 entries (one per segment in SEGMENTS), even
     when we can't compute a number — the "empty" entries carry a
     benchmark_confidence of "needs_research" and a rationale explaining
     why, so downstream viewers can render a clear "no estimate yet" state
