@@ -30,10 +30,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
+import truststore
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,14 @@ class ApolloClient:
 
     def __init__(self, api_key: str, timeout: int = 20):
         self.api_key = api_key
-        self._http = httpx.Client(timeout=timeout)
+        # verify=truststore's SSLContext uses the OS certificate store instead
+        # of httpx's bundled certifi list — see edgar.py for the corporate
+        # TLS-inspection failure mode this avoids. Every extractor in this
+        # pipeline that uses httpx must pass this.
+        self._http = httpx.Client(
+            timeout=timeout,
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        )
 
     def search(self, domain: str, titles: list[str], seniorities: Optional[list[str]] = None,
                 per_page: int = 25, max_pages: int = 1) -> list[dict]:
@@ -134,7 +143,14 @@ class PDLClient:
 
     def __init__(self, api_key: str, timeout: int = 20):
         self.api_key = api_key
-        self._http = httpx.Client(timeout=timeout)
+        # verify=truststore's SSLContext uses the OS certificate store instead
+        # of httpx's bundled certifi list — see edgar.py for the corporate
+        # TLS-inspection failure mode this avoids. Every extractor in this
+        # pipeline that uses httpx must pass this.
+        self._http = httpx.Client(
+            timeout=timeout,
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+        )
 
     def search(self, domain: str, job_title_role: Optional[str] = None, size: int = 25) -> list[dict]:
         must: list[dict] = [{"term": {"job_company_website": domain}}]
@@ -178,15 +194,39 @@ def _normalize_apollo(person: dict) -> dict:
     }
 
 
+def _pdl_str(person: dict, key: str) -> Optional[str]:
+    """
+    Get `key` from a raw PDL record as a string, else None.
+
+    PDL returns `true`/`false` in place of the real value — for strings AND
+    lists — whenever your plan doesn't have access to that field, instead of
+    omitting the key or using null. Any field pulled from PDL needs this
+    guard, or `person.get("full_name") or ""` yields `True`, producing a
+    stakeholder literally named `True`. (Ported from the now-retired
+    people_search.py's `PersonProfile._str`.)
+    """
+    v = person.get(key)
+    return v if isinstance(v, str) and v.strip() else None
+
+
+def _pdl_list(person: dict, key: str) -> list:
+    """Same guard as `_pdl_str`, but for fields expected to be lists — without
+    it, `person.get("job_title_levels") or []` can yield `True` (PDL's
+    no-access placeholder), and `levels[0]` then raises
+    `TypeError: 'bool' object is not subscriptable`."""
+    v = person.get(key)
+    return v if isinstance(v, list) else []
+
+
 def _normalize_pdl(person: dict) -> dict:
-    levels = person.get("job_title_levels") or []
+    levels = _pdl_list(person, "job_title_levels")
     return {
-        "name": person.get("full_name") or "",
-        "title": person.get("job_title") or "",
+        "name": _pdl_str(person, "full_name") or "",
+        "title": _pdl_str(person, "job_title") or "",
         "seniority": levels[0] if levels else None,
-        "location": person.get("location_name"),
-        "linkedin_url": person.get("linkedin_url"),
-        "email": person.get("work_email"),
+        "location": _pdl_str(person, "location_name"),
+        "linkedin_url": _pdl_str(person, "linkedin_url"),
+        "email": _pdl_str(person, "work_email"),
         "source": "pdl",
     }
 
